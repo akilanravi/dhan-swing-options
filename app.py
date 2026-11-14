@@ -957,6 +957,11 @@ def main():
         flow_gate = st.checkbox('Block CE when FII+DII both selling (PE: both buying)', False)
         fii_m = st.number_input('FII net Rs cr - manual override (0 = none)', value=0.0, step=100.0)
         dii_m = st.number_input('DII net Rs cr - manual override (0 = none)', value=0.0, step=100.0)
+        st.header('Automatic paper simulation')
+        auto_paper = st.checkbox('Auto-enter eligible option paper trades on SCAN NOW', False,
+                                 help='Uses Dhan option-chain ask prices; never places broker orders. Requires persistent Gist for durable records.')
+        auto_exit = st.checkbox('Update and exit paper positions on SCAN NOW', True,
+                                help='Only use Dhan option-chain LTP; no model premium fills. Runs when you scan, not continuously.')
         st.header('Option rules')
         min_days = st.number_input('Min days to monthly expiry', 5, 45, 15)
         d_lo, d_hi = st.slider('|Delta| range', 0.30, 0.90, (0.50, 0.65), 0.01)
@@ -1013,6 +1018,91 @@ def main():
 
     cache = get_cache()
     t1, t2, t3, t4 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading'])
+
+    def auto_paper_cycle(api, candidates=None):
+        """Run only on explicit SCAN NOW; no broker orders and no modeled option fills."""
+        notes = []
+        today = datetime.now(IST).date()
+        if auto_exit and not ss.paper.empty:
+            open_indices = list(ss.paper.index[ss.paper.status == 'OPEN'])
+            if open_indices:
+                quotes = live_premiums(api, ss.paper)
+                for idx in open_indices:
+                    t = ss.paper.loc[idx]
+                    ltp, err = quotes.get(t['id'], (np.nan, 'no quote'))
+                    if not np.isfinite(num(ltp)) or num(ltp) <= 0:
+                        notes.append(f"{t.symbol}: exit check skipped: {err or 'no valid Dhan premium'}")
+                        continue
+                    entry = num(t.entry_premium)
+                    if not np.isfinite(entry) or entry <= 0:
+                        continue
+                    qty = num(t.lots, 0) * num(t.lot_size, 0)
+                    ss.paper.loc[idx, ['last_premium', 'premium_source', 'unrealized_pnl', 'last_update']] = [
+                        ltp, 'Dhan chain LTP (snapshot)', round((ltp-entry)*qty, 2), today.isoformat()]
+                    sl = num(t.sl_frac, sl_frac)
+                    exp = pd.to_datetime(t.expiry, errors='coerce')
+                    expiry_days = (exp.date()-today).days if pd.notna(exp) else 999
+                    held = (today-pd.to_datetime(t.opened_at).date()).days
+                    reason = None
+                    if ltp <= entry*(1-sl): reason = 'PAPER PREMIUM STOP'
+                    elif ltp >= entry*(1+2*sl): reason = 'PAPER PREMIUM TARGET 2R'
+                    elif expiry_days <= 5: reason = 'PAPER EXPIRY EXIT'
+                    elif held >= 10: reason = 'PAPER TIME EXIT'
+                    if reason:
+                        # Snapshot prices are indicative, not executable historical fills.
+                        u = num(t.last_underlying, num(t.underlying_entry))
+                        close_row(ss.paper, idx, today.isoformat(), u, ltp, reason+' (Dhan LTP snapshot)', slip)
+                        notes.append(f'{t.symbol}: simulated exit at Dhan LTP {ltp:.2f} ({reason})')
+        if candidates is not None and auto_paper:
+            if journal.mode != 'gist':
+                notes.append('Automatic entries disabled: configure GITHUB_TOKEN + PAPER_GIST_ID for durable storage.')
+            elif not client_id:
+                notes.append('Automatic entries disabled: DHAN_CLIENT_ID missing.')
+            else:
+                eligible = candidates[candidates.Eligible].sort_values(['Score','ADX'], ascending=[False,False])
+                for _, row in eligible.iterrows():
+                    sym = row['Symbol']
+                    # Do not re-enter the same symbol/side/signal after closing it.
+                    previous = ss.paper[(ss.paper.symbol == sym) & (ss.paper.side == row['Side']) &
+                                        (ss.paper.signal_date.astype(str) == str(row['Date']))]
+                    if not previous.empty:
+                        continue
+                    opt = option_for_setup(api, row.to_dict(), opt_params, ss.seg_memory)
+                    ss.options[sym] = opt
+                    if opt.get('Verdict') != 'TRADE':
+                        notes.append(f"{sym}: skipped option: {opt.get('Note','not tradeable')}")
+                        continue
+                    prem, lot, lots = (num(opt.get('Entry premium (ask)')), int(num(opt.get('Lot size'),0)), int(num(opt.get('Lots'),0)))
+                    if not (np.isfinite(prem) and prem>0 and lot>0 and lots>0 and num(opt.get('Ask'))>0):
+                        notes.append(f'{sym}: missing verified ask, lot size or affordable position')
+                        continue
+                    exp = pd.to_datetime(opt.get('Expiry'), errors='coerce')
+                    if pd.isna(exp) or (exp.date()-today).days < int(min_days):
+                        continue
+                    bad = entry_guard(ss.paper, sym, row['Side'], prem*lot*lots, capital, int(max_open), max_exposure, weekly_limit)
+                    if bad:
+                        notes.append(f'{sym}: '+ '; '.join(bad))
+                        continue
+                    rec = {c: np.nan for c in JOURNAL_COLS}
+                    rec.update({'id':datetime.now(IST).strftime('%Y%m%d%H%M%S%f'),
+                                'opened_at':datetime.now(IST).isoformat(timespec='seconds'),
+                                'signal_date':str(row['Date']), 'symbol':sym,'side':row['Side'],
+                                'status':'OPEN','setup':row['Status'],'score':row['Score'],
+                                'underlying_entry':row['Close'],'underlying_sl':row['Underlying SL'],
+                                'underlying_t1':row['Target 1 (1R)'],'underlying_t2':row['Target 2 (2R)'],
+                                'contract':opt['Contract'],'expiry':opt['Expiry'],'strike':opt['Strike'],
+                                'lot_size':lot,'lots':lots,'entry_premium':prem,'entry_delta':opt.get('Delta'),
+                                'entry_iv':opt.get('IV %'),'sl_frac':sl_frac,
+                                'sid':row.sid,'segment':row.segment,'instrument':row.instrument,
+                                'chain_sid':opt['chain_sid'],'chain_seg':opt['chain_seg'],
+                                'stop_current':row['Underlying SL'],'t1_hit':False,'days_held':0,
+                                'last_premium':prem,'premium_source':'Dhan ask snapshot',
+                                'unrealized_pnl':0.0,'notes':'AUTOMATED PAPER ONLY; quote snapshot, not actual fill'})
+                    ss.paper = pd.concat([ss.paper,pd.DataFrame([rec])],ignore_index=True)
+                    notes.append(f'{sym}: paper entry {opt["Contract"]}, {lots} lot(s), ask {prem:.2f}')
+        if notes:
+            persist()
+        return notes
 
     # ============================ TAB 1 ============================
     with t1:
@@ -1087,6 +1177,9 @@ def main():
                 ss.options = {}
                 store[skey] = {'scan': ss.scan, 'history': ss.history}
                 st.success(f'Scanned {len(results)} instruments in {time.monotonic() - t0:.0f}s ({len(errors)} failed).')
+            if results and (auto_paper or auto_exit):
+                for message in auto_paper_cycle(api, ss.scan):
+                    st.info(message)
             ss.scan_errors = pd.DataFrame(errors)
         if not ss.scan_errors.empty:
             with st.expander(f'{len(ss.scan_errors)} instruments failed'):
@@ -1182,7 +1275,7 @@ def main():
     with t4:
         st.subheader('Paper trading journal (option premium based)')
         mode = journal.mode
-        st.caption(f"Storage: {'GitHub Gist (permanent)' if mode == 'gist' else 'local file (lost when Streamlit Cloud reboots - add GITHUB_TOKEN)'} · {ss.get('paper_msg', '')}")
+        st.caption(f"Storage: {'GitHub Gist (persistent)' if mode == 'gist' else 'local file (lost when Streamlit Cloud reboots - add GITHUB_TOKEN)'} · {ss.get('paper_msg', '')}")
         if mode == 'gist' and ss.get('gist_id') and not secret('PAPER_GIST_ID'):
             st.warning(f"Add this to Streamlit Secrets so the journal reloads after a reboot:  PAPER_GIST_ID = \"{ss.gist_id}\"")
         jr = ss.paper
@@ -1245,7 +1338,7 @@ def main():
             prem = e1.number_input('Entry premium', 0.0, 100000.0, float(o.get('Entry premium (ask)') or 0.0), 0.05, key=f'pp_{sym}')
             lot = e2.number_input('Lot size', 0, 100000, int(o.get('Lot size') or num(row.get('Lot size'), 0)), key=f'pl_{sym}')
             auto_lots = size_position(capital, risk_pct, prem, lot, sl_frac, max_exposure)[0] if prem > 0 and lot > 0 else 0
-            lots = e3.number_input('Lots', 0, 1000, int(auto_lots), key=f'pn_{sym}_{auto_lots}')
+            lots = e3.number_input('Lots', min_value=0, max_value=max(1000, int(auto_lots)), value=max(0, min(1000, int(auto_lots))), key=f'pn_{sym}')
             strike = e4.number_input('Strike', 0.0, 1000000.0, float(o.get('Strike') or 0.0), key=f'ps_{sym}')
             exp_txt = st.text_input('Expiry (YYYY-MM-DD)', o.get('Expiry', ''), key=f'pe_{sym}')
             if st.button('Record paper entry'):

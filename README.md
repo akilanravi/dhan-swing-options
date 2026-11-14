@@ -1,36 +1,30 @@
-# Dhan Swing Options V4 (single file)
+# Dhan Swing Options V3.7 — Streamlit paper-trading fix
 
-Upload only **app.py** and **requirements.txt** to the root of your GitHub repo (replace the old ones).
-`dhan_api.py` and `signals.py` are no longer used - you can delete them.
+## Deployment
+Replace repository files with this folder's files, commit to `main`, and let Streamlit Community Cloud redeploy. Main file: `app.py`.
 
 ## Streamlit Secrets
 ```toml
-DHAN_ACCESS_TOKEN = "..."
-DHAN_CLIENT_ID    = "..."
-# optional but recommended - permanent paper journal (private GitHub Gist)
-GITHUB_TOKEN      = "..."   # classic token with only the 'gist' scope
-PAPER_GIST_ID     = ""      # leave empty first; after the first paper trade the app shows the id -> paste it here
+DHAN_CLIENT_ID = "YOUR_DHAN_CLIENT_ID"
+DHAN_ACCESS_TOKEN = "YOUR_DHAN_ACCESS_TOKEN"
+GITHUB_TOKEN = "YOUR_GITHUB_FINE_GRAINED_OR_CLASSIC_GIST_WRITE_TOKEN"
+# After the first journal save, copy the displayed ID here:
+PAPER_GIST_ID = "YOUR_EXISTING_PRIVATE_GIST_ID"
 ```
-Dhan access tokens expire (about 24h). If every instrument fails with 401 / DH-901, generate a new token.
+Never commit secrets to GitHub. Gist write access is required for permanent paper-trade storage. Treat the Gist as sensitive, even when unlisted/private.
 
-## What it does
-1. **Scanner** - one click scans all F&O stocks + NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50 in parallel
-   (one candle request per stock, cached 6h). Index volume = near-month index-futures volume (proxy, flagged).
-2. **Status ranking** - FRESH ENTRY (strict signal on last candle) > MONTH SETUP (score >= 8, EMA-cross/CPR breakout
-   this month, all hard gates pass, not extended > 2 ATR from EMA21) > WATCHLIST > REJECTED. Each row shows monthly
-   bull/bear, MTD %, trigger date/type, exact blocking reasons, FII/DII bias.
-3. **Option picker** - monthly expiry >= 15 days, ATM/1-ITM, |delta| 0.50-0.65, spread <= 5%, OI/volume > 0,
-   lot size from Dhan master, lots from risk budget and 20% exposure cap. It says NO TRADE when one lot is too big.
-4. **Paper trading** - premium-based journal; "Update open trades" replays daily candles and applies SL (1.5 ATR),
-   -30% premium stop, T1 breakeven + EMA21 trail, T2, EMA-cross/Supertrend exit, 5-day no-progress exit, <=5 days to
-   expiry exit, 10-day max hold. Rules enforced on entry: max 3 open, no two index trades, 20% exposure,
-   4% weekly loss limit, pause after 3 straight losses. Stats + equity curve. Export/import CSV.
+## Changes
+- Fixes `StreamlitValueAboveMaxError` for Lots input when the auto-calculated lots exceed 1000.
+- Optional automatic paper entries for eligible CE/PE signals when pressing **SCAN NOW**. Only contracts with Dhan option-chain ask, delta/spread, monthly expiry, valid lot size and positive affordable lots are considered. Never sends orders.
+- Optional automatic paper exits on **SCAN NOW** based on current Dhan chain LTP snapshot: 30% stop, 2R target, within 5 days of expiry, or 10 calendar days holding. These are simulated snapshot executions, NOT actual fills and not intraday continuous monitoring.
+- Existing manual paper update and trailing/underlying exit logic remain available in Paper Trading tab.
+- Re-entry for the same signal date/symbol/side is blocked, as are max open trades, premium exposure and weekly loss limits.
+- Entries require Gist configuration for persistence; the journal may still fail to save if GitHub credentials/permissions are wrong. Check the status text and verify the Gist exists before relying on persistence.
 
-## Limits (read before trusting numbers)
-- Not live-tested against your Dhan account by the author: first run may reveal mapping issues (errors are listed per symbol).
-- Stock option-chain segment (NSE_FNO vs NSE_EQ) is auto-tried; if both fail the Note column shows Dhan's message.
-- Paper P&L for model exits is a delta-only estimate (no theta/IV change) - optimistic. "chain LTP" is used for live marks.
-- IV percentile, earnings dates and historical option premiums are not available from Dhan: add event dates manually.
-- FII/DII is market-wide, fetched best-effort from NSE (may be blocked on cloud) or entered manually; it is context only
-  unless you tick the block option.
-- Research tool only. No orders are sent. No profit is guaranteed.
+## Limitations
+- Streamlit Cloud runs on interactions, not as a 24/7 market monitor. There is no unattended exit between scans; price can gap through a stop.
+- Option-chain snapshots are not trade executions. Premium-based simulated P&L includes estimated charges/slippage, but does not reconstruct historical intraday prices.
+- No IV percentile history, earnings calendar automation, or robust stock-to-stock correlation checks.
+- Monthly setup eligibility is inherited from the existing strategy; it can be stale and should be paper-tested first.
+- Institutional flows are market-wide, not stock-specific, and may be delayed.
+- Dhan API limits apply to option chain requests.
