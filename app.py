@@ -988,6 +988,10 @@ def main():
 
     # ---- session state
     ss = st.session_state
+    if ss.get('schema') != 'v4':          # stale session data from an older version of the app -> start clean
+        for k in ('scan', 'history', 'options', 'scan_errors', 'paper', 'paper_msg', 'universe', 'master'):
+            ss.pop(k, None)
+        ss['schema'] = 'v4'
     store = get_scan_store()
     skey = hashlib.sha256((token or 'none').encode()).hexdigest()[:12]
     if 'scan' not in ss:
@@ -1095,8 +1099,8 @@ def main():
             m3.metric('Month setups', int((s.Status == 'MONTH SETUP').sum()))
             m4.metric('Watchlist', int((s.Status == 'WATCHLIST').sum()))
             m5.metric('Bullish / Bearish month', f"{int((s['Monthly trend'] == 'BULLISH').sum())} / {int((s['Monthly trend'] == 'BEARISH').sum())}")
-            show(s.drop(columns=HIDE))
-            st.download_button('Download scanner CSV', s.drop(columns=HIDE).to_csv(index=False).encode(), 'dhan_scan.csv')
+            show(s.drop(columns=HIDE, errors='ignore'))
+            st.download_button('Download scanner CSV', s.drop(columns=HIDE, errors='ignore').to_csv(index=False).encode(), 'dhan_scan.csv')
         else:
             st.info('Press SCAN NOW. All F&O stocks + indices are scanned in parallel (about 1-2 minutes first time; repeat scans use the 6h cache).')
 
@@ -1114,7 +1118,7 @@ def main():
             if elig.empty:
                 st.warning('No eligible setup in this scan. Do not force a trade.')
             else:
-                show(elig.drop(columns=HIDE))
+                show(elig.drop(columns=HIDE, errors='ignore'))
                 top_n = st.slider('Fetch option contracts for the top N eligible setups', 1, 15, min(5, len(elig)))
                 if st.button('Select monthly CE/PE contracts (Dhan option chain)', type='primary', disabled=not (token and client_id)):
                     api = DhanAPI(token, client_id)
@@ -1136,9 +1140,9 @@ def main():
             for lbl, status in (('Watchlist (score ≥ month minimum but a hard gate blocks)', 'WATCHLIST'),):
                 w = s[s.Status == status]
                 with st.expander(f'{lbl}: {len(w)}'):
-                    show(w.drop(columns=HIDE))
+                    show(w.drop(columns=HIDE, errors='ignore'))
             with st.expander(f'Rejected: {int((s.Status == "REJECTED").sum())}'):
-                show(s[s.Status == 'REJECTED'].drop(columns=HIDE))
+                show(s[s.Status == 'REJECTED'].drop(columns=HIDE, errors='ignore'))
             if not ss.history.empty:
                 with st.expander('Historical daily signals in lookback window (NOT fresh entries)'):
                     show(ss.history.sort_values('Date', ascending=False))
@@ -1151,7 +1155,7 @@ def main():
         else:
             sym = st.selectbox('Instrument', s.Symbol.tolist(), key='an_sym')
             row = s[s.Symbol == sym].iloc[0]
-            show(pd.DataFrame([row.drop(labels=HIDE)]))
+            show(pd.DataFrame([row.drop(labels=HIDE, errors='ignore')]))
             if row['Hard blocks']: st.warning('Hard blocks: ' + row['Hard blocks'])
             if token:
                 try:
