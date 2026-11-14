@@ -1294,7 +1294,16 @@ def main():
             c1, c2 = st.columns(2)
             with c1:
                 st.caption('Signal classification')
-                st.bar_chart(s['Status'].value_counts().rename('Setups'))
+                if not all_df.empty and 'Status' in all_df.columns:
+    status_counts = (
+        all_df['Status']
+        .fillna('Unknown')
+        .value_counts()
+        .rename('Setups')
+    )
+    st.bar_chart(status_counts)
+else:
+    st.info("No scanner results available yet.")
             with c2:
                 st.caption('CE vs PE signals')
                 st.bar_chart(s['Side'].value_counts().rename('Setups'))
