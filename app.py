@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import altair as alt
 
 IST = ZoneInfo('Asia/Kolkata')
 BASE = 'https://api.dhan.co/v2'
@@ -54,8 +55,10 @@ def last_complete_session() -> date:
     n = datetime.now(IST)
     d = n.date()
     if n.weekday() >= 5:
-        return d
-    return d if (n.hour, n.minute) >= (15, 45) else d - timedelta(days=1)
+        return d - timedelta(days=n.weekday() - 4)
+    if (n.hour, n.minute) < (15, 45):
+        d -= timedelta(days=1)
+    return d - timedelta(days=(d.weekday() - 4) % 7) if d.weekday() >= 5 else d
 
 
 def num(x, default=np.nan) -> float:
@@ -1350,6 +1353,33 @@ def main():
                 with st.expander('Historical daily signals in lookback window (NOT fresh entries)'):
                     show(ss.history.sort_values('Date', ascending=False))
 
+def candle_chart(df):
+    """Native Streamlit/Altair OHLC chart; no Plotly or external JavaScript CDN."""
+    if df is None or df.empty:
+        st.info('No candle data available.')
+        return
+    source = df.reset_index().rename(columns={df.index.name or 'index': 'Date'}).copy()
+    source['Date'] = pd.to_datetime(source['Date'])
+    source['Direction'] = np.where(source['Close'] >= source['Open'], 'Bullish', 'Bearish')
+    x = alt.X('Date:T', title='Trading date', axis=alt.Axis(format='%d %b', labelColor='#c6d7f0', titleColor='#c6d7f0'))
+    y = alt.Y('Low:Q', title='Price (₹)', scale=alt.Scale(zero=False), axis=alt.Axis(labelColor='#c6d7f0', titleColor='#c6d7f0'))
+    color = alt.Color('Direction:N', scale=alt.Scale(domain=['Bullish', 'Bearish'], range=['#27e5ac', '#ff608c']), legend=None)
+    tooltip = [alt.Tooltip('Date:T', format='%d %b %Y'), alt.Tooltip('Open:Q', format=',.2f'),
+               alt.Tooltip('High:Q', format=',.2f'), alt.Tooltip('Low:Q', format=',.2f'),
+               alt.Tooltip('Close:Q', format=',.2f'), alt.Tooltip('Volume:Q', format=',.0f')]
+    base = alt.Chart(source).encode(x=x, color=color, tooltip=tooltip)
+    wicks = base.mark_rule(strokeWidth=1.5).encode(y=y, y2='High:Q')
+    bodies = base.mark_bar(size=6).encode(y=alt.Y('Open:Q', scale=alt.Scale(zero=False)), y2='Close:Q')
+    layers = [wicks, bodies]
+    for period, line_color in [(9, '#facc15'), (21, '#69b9ff'), (50, '#ff9f70'), (200, '#c5a0ff')]:
+        field = f'ema{period}'
+        if field in source:
+            layers.append(alt.Chart(source.dropna(subset=[field])).mark_line(color=line_color, strokeWidth=1.6).encode(x=x, y=alt.Y(f'{field}:Q', scale=alt.Scale(zero=False)), tooltip=[alt.Tooltip('Date:T'), alt.Tooltip(f'{field}:Q', format=',.2f')]))
+    chart = alt.layer(*layers).resolve_scale(y='shared').properties(height=430, background='#0b1424').configure_view(stroke=None)
+    st.altair_chart(chart, use_container_width=True)
+    st.caption('Green = Close ≥ Open · Red = Close < Open · EMA9 yellow · EMA21 blue · EMA50 orange · EMA200 purple')
+
+
     # ============================ TAB 3 ============================
     with t3:
         s = ss.scan
@@ -1368,7 +1398,7 @@ def main():
                         x['fut_sid'] = str(idf.set_index('symbol').loc[sym, 'fut_sid'])
                     daily = load_daily(DhanAPI(token, client_id), cache, x, last_complete_session())
                     d = indicators(daily).tail(120)
-                    st.line_chart(d[['Close', 'ema21', 'ema50', 'ema200']])
+                    candle_chart(d)
                     st.caption('Candle table colors (as requested): 🟢 Open > Close · 🔴 Open < Close · ⚪ Equal')
                     show(d.tail(10)[['Open', 'High', 'Low', 'Close', 'Volume', 'ema9', 'ema21', 'adx', 'rsi', 'st_dir', 'cpr_width']].round(2).reset_index(), hide_index=True)
                 except Exception as e:
