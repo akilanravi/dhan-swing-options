@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64  # noqa: F401  (kept for future use)
 import hashlib
 import io
+import html
 import math
 import os
 import threading
@@ -923,9 +924,57 @@ STATUS_RANK = {'FRESH ENTRY': 0, 'MONTH SETUP': 1, 'WATCHLIST': 2, 'REJECTED': 3
 HIDE = ['sid', 'segment', 'instrument']
 
 
+
+def apply_dark_theme():
+    st.markdown("""<style>
+    .stApp {background: radial-gradient(ellipse at 85% 0%,#14233a 0%,#080c17 45%,#05070e 100%); color:#e8f2ff;}
+    [data-testid="stSidebar"] {background:linear-gradient(180deg,#101b31,#070c18); border-right:1px solid #26354c;}
+    [data-testid="stHeader"] {background:transparent;}
+    h1,h2,h3 {color:#eaf5ff!important;letter-spacing:-.03em;}
+    h1 {background:linear-gradient(90deg,#6ee7ff,#b69bff,#ff76c7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+    div[data-testid="stMetric"] {background:#101d32;border:1px solid #28435b;border-radius:16px;padding:14px;}
+    div[data-testid="stMetricValue"] {color:#68e8ff;}
+    div[data-testid="stTabs"] button[aria-selected="true"] {color:#69f4d3!important;border-bottom-color:#69f4d3!important;}
+    div[data-testid="stDataFrame"] {border:1px solid #263a55;border-radius:12px;overflow:hidden;}
+    div.stButton>button[kind="primary"] {background:linear-gradient(110deg,#1763ed,#8546d8);color:white;border:0;border-radius:11px;}
+    .signal-card {background:linear-gradient(140deg,#15223a,#0c1426);border:1px solid #324862;border-radius:18px;padding:18px;min-height:220px;margin-bottom:12px;box-shadow:0 9px 25px #0004;}
+    .signal-card.ce {border-top:3px solid #28e2ad;} .signal-card.pe {border-top:3px solid #ff5f94;}
+    .signal-name {font-size:1.25rem;font-weight:800;color:#f2f8ff;}
+    .signal-sub {color:#a9bdd5;font-size:.8rem;margin:6px 0 12px;}
+    .signal-score {font-size:2rem;font-weight:800;color:#80e8ff;}
+    .signal-pill {display:inline-block;background:#263958;color:#dcf6ff;padding:5px 10px;border-radius:20px;font-size:.75rem;}
+    .signal-levels {color:#d2e4f7;font-size:.82rem;line-height:1.9;}
+    .signal-good {color:#37e6b1;} .signal-bad {color:#ff9dba;}
+    </style>""", unsafe_allow_html=True)
+
+
+def eligible_card(row):
+    def safe(x): return html.escape(str(x))
+    side = str(row.get('Side', ''))
+    cls = 'ce' if side == 'CE' else 'pe'
+    name = safe(row.get('Symbol', 'Unknown'))
+    score = safe(row.get('Score', '—'))
+    status = safe(row.get('Status', '—'))
+    trend = safe(row.get('Monthly trend', '—'))
+    entry = num(row.get('Close'))
+    stop = num(row.get('Underlying SL'))
+    t1 = num(row.get('Target 1 (1R)'))
+    t2 = num(row.get('Target 2 (2R)'))
+    def price(v): return f'₹{v:,.2f}' if np.isfinite(v) else '—'
+    return f"""<div class="signal-card {cls}">
+      <div class="signal-name">{name} <span class="signal-pill">{safe(side)}</span></div>
+      <div class="signal-sub">{status} · Monthly trend: {trend}</div>
+      <div class="signal-score">{score}<span style="font-size:.85rem;color:#9bb0ca"> / 10</span></div>
+      <div class="signal-levels">Underlying entry: <b>{price(entry)}</b><br>
+      Underlying SL: <b class="signal-bad">{price(stop)}</b><br>
+      Target 1: <b class="signal-good">{price(t1)}</b> · Target 2: <b class="signal-good">{price(t2)}</b></div>
+      <div class="signal-sub">Reference underlying levels; option premiums must be validated separately.</div>
+    </div>"""
+
 def main():
-    st.set_page_config(page_title='Dhan Swing Options V4', page_icon='📊', layout='wide')
-    st.title('Dhan Swing Options V4 | F&O Scanner + Option Picker + Paper Trading')
+    st.set_page_config(page_title='Dhan Swing Options V3.8 Neon', page_icon='📊', layout='wide')
+    apply_dark_theme()
+    st.title('DHAN QUANT · SWING OPTIONS TERMINAL')
     st.caption('Dhan API only · manual execution · no orders are ever sent · research tool, not advice, no guaranteed profit')
 
     def secret(name):
@@ -1017,7 +1066,7 @@ def main():
         ss.gist_id = journal.gist_id
 
     cache = get_cache()
-    t1, t2, t3, t4 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading'])
+    t1, t2, t3, t4, t5 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards'])
 
     def auto_paper_cycle(api, candidates=None):
         """Run only on explicit SCAN NOW; no broker orders and no modeled option fills."""
@@ -1197,6 +1246,19 @@ def main():
         else:
             st.info('Press SCAN NOW. All F&O stocks + indices are scanned in parallel (about 1-2 minutes first time; repeat scans use the 6h cache).')
 
+            # Visual market overview (only scanned symbols; not whole-market breadth)
+            st.subheader('Scan overview')
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption('Signal classification')
+                st.bar_chart(s['Status'].value_counts().rename('Setups'))
+            with c2:
+                st.caption('CE vs PE signals')
+                st.bar_chart(s['Side'].value_counts().rename('Setups'))
+            if 'Score' in s:
+                st.caption('Technical scores · count of scanned setups')
+                st.bar_chart(s['Score'].value_counts().sort_index().rename('Setups'))
+
     # ============================ TAB 2 ============================
     with t2:
         s = ss.scan
@@ -1270,6 +1332,14 @@ def main():
                 st.write(f"**{o.get('Contract', sym)}** · verdict **{o['Verdict']}** · {o.get('Note', '')}")
                 if isinstance(o.get('_cand'), pd.DataFrame) and not o['_cand'].empty:
                     show(o['_cand'].round(2))
+
+            st.subheader('Technical condition dashboard')
+            fields = ['Score', 'ADX', 'RSI', 'Weekly CPR width %']
+            cols = st.columns(4)
+            for col, field in zip(cols, fields):
+                if field in row.index:
+                    col.metric(field, f'{num(row[field]):.2f}' if np.isfinite(num(row[field])) else '—')
+            st.caption('Indicator values are from the most recent completed daily candle.')
 
     # ============================ TAB 4 ============================
     with t4:
@@ -1403,5 +1473,39 @@ def main():
             except Exception as e: st.error(str(e))
         st.download_button('Export journal CSV', normalize_journal(ss.paper).to_csv(index=False).encode(), 'paper_trades.csv')
 
+
+    # ============================ TAB 5 ============================
+    with t5:
+        st.subheader('ELIGIBLE · CE / PE SIGNAL BOARD')
+        st.caption('Only confirmed eligible setups appear here. A score alone does not make a trade eligible. Data reflects the last completed scan, not live tick-by-tick prices.')
+        s = ss.scan
+        if s.empty:
+            st.info('Run SCAN NOW on the Market scanner tab to populate these cards.')
+        else:
+            eligible = s[s['Eligible'].fillna(False).astype(bool)].copy()
+            a, b, c = st.columns(3)
+            a.metric('Eligible setups', len(eligible))
+            b.metric('CE opportunities', int((eligible['Side'] == 'CE').sum()))
+            c.metric('PE opportunities', int((eligible['Side'] == 'PE').sum()))
+            side_filter = st.radio('Show signals', ['All', 'CE', 'PE'], horizontal=True, key='board_side')
+            if side_filter != 'All': eligible = eligible[eligible['Side'] == side_filter]
+            if eligible.empty:
+                st.warning('No fully eligible setups in this scan. High-scoring rejected stocks remain visible in the Top CE/PE tab.')
+            else:
+                eligible = eligible.sort_values(['Score','ADX'], ascending=[False,False])
+                rows = eligible.to_dict('records')
+                for i in range(0, len(rows), 3):
+                    for col, row in zip(st.columns(3), rows[i:i+3]):
+                        with col: st.markdown(eligible_card(row), unsafe_allow_html=True)
+                st.subheader('Eligible signal comparison')
+                st.bar_chart(eligible.set_index('Symbol')['Score'])
+                st.download_button('Export eligible setups', eligible.drop(columns=HIDE, errors='ignore').to_csv(index=False).encode(), 'eligible_setups.csv')
+            st.divider()
+            st.subheader('High-score watchlist · not confirmed entries')
+            watch = s[(~s['Eligible'].fillna(False).astype(bool)) & (pd.to_numeric(s['Score'], errors='coerce') >= month_min)]
+            if not watch.empty:
+                show(watch.sort_values('Score', ascending=False).drop(columns=HIDE, errors='ignore'))
+            else:
+                st.caption('No high-score watchlist setups in the current scan.')
 
 main()
