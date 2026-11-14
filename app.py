@@ -1,298 +1,1310 @@
+# -*- coding: utf-8 -*-
+"""
+Dhan Swing Options V4  |  single-file Streamlit app
+---------------------------------------------------
+Dhan API only. No Yahoo, no Telegram, no automatic orders (analysis + paper trading).
+
+Contents
+  1. Dhan API client (rate-limited, parallel-safe) + instrument master -> F&O universe
+  2. Indicators, 10-point scoring, monthly trend / trigger analysis
+  3. Option contract selection (monthly expiry, ATM/1-ITM, delta, spread) + position sizing + costs
+  4. Paper-trading engine (premium based, auto SL/target/trail/time/signal exits, risk rules,
+     persistent journal in a private GitHub Gist or a local file)
+  5. Streamlit UI (4 tabs)
+
+Secrets (Streamlit Cloud -> App settings -> Secrets):
+  DHAN_ACCESS_TOKEN = "..."
+  DHAN_CLIENT_ID    = "..."
+  GITHUB_TOKEN      = "..."   # optional, token with the 'gist' scope -> permanent paper journal
+  PAPER_GIST_ID     = "..."   # optional, filled after the first save (the app shows the id)
+"""
+from __future__ import annotations
+
+import base64  # noqa: F401  (kept for future use)
+import hashlib
+import io
+import math
 import os
-from datetime import date, timedelta
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
-from dhan_api import DhanAPI, read_instrument_master, build_universe
-from signals import indicators, annotate, score, rejection_reasons
-from institutional import fetch_moneycontrol_flows, summarize
 
-st.set_page_config(page_title='Dhan Swing Options V3', page_icon='📊', layout='wide')
-st.title('Dhan Swing Options V3.6 | Monthly Scanner + Institutional Flows')
-st.caption('Dhan API for trading data · Moneycontrol for published institutional cash flows · No Telegram · No Yahoo · Manual orders only')
+IST = ZoneInfo('Asia/Kolkata')
+BASE = 'https://api.dhan.co/v2'
+MASTER_URL = 'https://images.dhan.co/api-data/api-scrip-master-detailed.csv'
+INDEX_IDS = {'NIFTY': '13', 'BANKNIFTY': '25', 'FINNIFTY': '27', 'MIDCPNIFTY': '442', 'NIFTYNXT50': '38'}
+INDEX_GROUP = set(INDEX_IDS)
+JOURNAL_FILE = 'paper_trades.csv'
+GIST_FILE = 'paper_trades.csv'
 
-try:
-    secret_token = st.secrets.get('DHAN_ACCESS_TOKEN', '')
-    secret_client_id = st.secrets.get('DHAN_CLIENT_ID', '')
-except Exception:
-    secret_token = ''
-    secret_client_id = ''
-with st.sidebar:
-    st.header('Dhan connection')
-    token = st.text_input('Access token', value=os.getenv('DHAN_ACCESS_TOKEN', secret_token), type='password')
-    client_id = os.getenv('DHAN_CLIENT_ID', secret_client_id)
-    st.caption('Option-chain client ID: ' + ('configured' if client_id else 'MISSING — add DHAN_CLIENT_ID in Streamlit Secrets'))
-    capital = st.number_input('Capital (₹)', 1000, 100000000, 100000, 5000)
-    risk_pct = st.slider('Risk per trade (%)', 1.0, 2.0, 1.0, .5)
-    cpr_width = st.slider('Maximum weekly CPR width (%)', .1, 5.0, 1.5, .1) / 100
-    min_score = st.slider('Minimum score', 7, 10, 7)
-    st.caption('A score of 7 does not override mandatory trend, volume, ADX and trigger filters.')
-    st.header('Scan settings')
-    scan_days = st.selectbox('Signal lookback', [1, 5, 10, 20], index=3, help='Trading days. Includes older historical signals; not all are current entries.')
-    scan_limit = st.number_input('Maximum F&O stocks per scan', 1, 400, 30, 10, help='Start with 10–30; Dhan API requests are rate-limited.')
-    index_vol = st.checkbox('Include indices in scanner', value=True)
-    st.caption('Index spot volume may be zero. Such index signals remain unconfirmed and cannot become eligible trades.')
-    events = st.text_area('Event blackout dates (YYYY-MM-DD, one per line)', '')
-    st.caption('Moneycontrol institutional flows are published cash-market totals, not live intraday ticks. Each scan attempts a fresh fetch.')
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_flows():
-    return summarize(fetch_moneycontrol_flows())
+# =====================================================================================
+# 0. small helpers
+# =====================================================================================
+def last_complete_session() -> date:
+    """Latest date whose daily candle is complete (NSE closes 15:30 IST; 15:45 gives buffer)."""
+    n = datetime.now(IST)
+    d = n.date()
+    if n.weekday() >= 5:
+        return d
+    return d if (n.hour, n.minute) >= (15, 45) else d - timedelta(days=1)
 
-flows = None
-flow_error = None
-try:
-    flows = cached_flows()
-except Exception as exc:
-    flow_error = str(exc)
-with st.sidebar:
-    st.header('Institutional data · Moneycontrol')
-    if flows:
-        st.write(f"Latest published: {flows['date']}")
-        st.write(f"FII ₹Cr: {flows['fii_net']:+,.2f} | DII ₹Cr: {flows['dii_net']:+,.2f}")
-        st.caption(f"5-session sentiment: {flows['sentiment']}")
-    else:
-        st.warning('Institutional data unavailable — no figures assumed')
-        st.caption(flow_error or '')
 
-if 'scan' not in st.session_state: st.session_state.scan = pd.DataFrame()
-if 'history' not in st.session_state: st.session_state.history = pd.DataFrame()
-if 'paper' not in st.session_state:
-    st.session_state.paper = pd.DataFrame(columns=['id','opened_at','symbol','side','reference_entry','reference_stop','reference_target1','reference_target2','score','status','closed_at','reference_exit','underlying_points','notes'])
-if 'master' not in st.session_state: st.session_state.master = None
-if 'universe' not in st.session_state: st.session_state.universe = pd.DataFrame()
-if 'scan_errors' not in st.session_state: st.session_state.scan_errors = pd.DataFrame()
+def num(x, default=np.nan) -> float:
+    try:
+        v = float(x)
+        return default if math.isnan(v) else v
+    except (TypeError, ValueError):
+        return default
 
-config = {'min_score': min_score, 'max_weekly_cpr_width': cpr_width,
-          'event_blackout_dates': {}}
-blackouts = [x.strip() for x in events.splitlines() if x.strip()]
 
-# Cached public master and completed daily candles; cache is shared across reruns.
-# Access token is part of the cache key to avoid cross-account reuse.
-@st.cache_data(ttl=86400, show_spinner=False)
-def cached_master():
-    return read_instrument_master()
+def show(df, **kw):
+    """st.dataframe that works on old and new Streamlit versions."""
+    kw.setdefault('hide_index', True)
+    try:
+        st.dataframe(df, width='stretch', **kw)
+    except TypeError:
+        st.dataframe(df, use_container_width=True, **kw)
 
-@st.cache_data(ttl=21600, max_entries=1200, show_spinner=False)
-def cached_daily(token_value, client_value, sid, segment, instrument, through_date):
-    api = DhanAPI(token_value, client_id=client_value)
-    end = pd.Timestamp(through_date).date() + timedelta(days=1)
-    return api.candles(sid, segment, instrument, end-timedelta(days=400), end)
 
-t1,t2,t3,t4 = st.tabs(['1 · Market scanner','2 · Top CE/PE setups','3 · Trade analysis','4 · Paper trading'])
-with t1:
-    st.subheader('Automatically load current NSE F&O universe')
-    st.caption('Automatically downloads the current Dhan instrument master. No file upload needed.')
-    if st.button('Refresh Dhan instrument master', type='secondary'):
-        cached_master.clear()
-        st.session_state.universe = pd.DataFrame()
-    if st.session_state.universe.empty:
+# =====================================================================================
+# 1. DHAN API
+# =====================================================================================
+class RateLimiter:
+    def __init__(self, interval: float):
+        self.interval, self.lock, self.next = interval, threading.Lock(), 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            start = max(now, self.next)
+            self.next = start + self.interval
+        if start - now > 0:
+            time.sleep(start - now)
+
+
+DATA_LIMITER = RateLimiter(0.22)    # Dhan data APIs: ~5 requests / second
+EXPIRY_LIMITER = RateLimiter(1.0)
+CHAIN_LIMITER = RateLimiter(3.2)    # Option chain: 1 unique request / 3 seconds
+
+
+def frame_from_response(out):
+    out = out.get('data', out) if isinstance(out, dict) else out
+    if not isinstance(out, dict) or not out.get('timestamp'):
+        return None
+    n = len(out['timestamp'])
+    d = pd.DataFrame({name: out.get(src, [0] * n) for src, name in
+                      [('open', 'Open'), ('high', 'High'), ('low', 'Low'), ('close', 'Close'), ('volume', 'Volume')]})
+    d.index = pd.to_datetime(out['timestamp'], unit='s', utc=True).tz_convert('Asia/Kolkata').tz_localize(None).normalize()
+    for c in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        d[c] = pd.to_numeric(d[c], errors='coerce')
+    d['Volume'] = d['Volume'].fillna(0)
+    return d.dropna(subset=['Open', 'High', 'Low', 'Close'])
+
+
+class DhanAPI:
+    def __init__(self, token: str, client_id: str = ''):
+        if not token:
+            raise ValueError('Dhan access token is required')
+        self.client_id = str(client_id or '').strip()
+        self.session = requests.Session()
+        self.session.headers.update({'access-token': token.strip(), 'Content-Type': 'application/json',
+                                     'Accept': 'application/json'})
+
+    def post(self, path, payload, limiter=DATA_LIMITER, with_client=False):
+        headers = {'client-id': self.client_id} if (with_client and self.client_id) else {}
+        last = ''
+        for attempt in range(4):
+            limiter.wait()
+            try:
+                r = self.session.post(BASE + path, json=payload, headers=headers, timeout=25)
+            except requests.RequestException as e:
+                last = f'network error: {e}'
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                last = f'HTTP {r.status_code}'
+                time.sleep(2.5 * (attempt + 1))
+                continue
+            if r.status_code >= 400:
+                raise RuntimeError(f'Dhan HTTP {r.status_code}: {r.text[:250]}')
+            out = r.json()
+            if isinstance(out, dict) and out.get('status') == 'failure':
+                raise RuntimeError(str(out.get('remarks', out))[:250])
+            return out
+        raise RuntimeError(f'Dhan request failed after retries ({last})')
+
+    def daily(self, sid, segment, instrument, start, end):
+        """ONE request for the whole range (fast). Falls back to 85-day chunks only if too little came back."""
+        start, end = pd.Timestamp(start), pd.Timestamp(end)
+
+        def one(a, b):
+            payload = {'securityId': str(sid), 'exchangeSegment': segment, 'instrument': instrument,
+                       'expiryCode': 0, 'oi': False,
+                       'fromDate': a.strftime('%Y-%m-%d'), 'toDate': b.strftime('%Y-%m-%d')}
+            return frame_from_response(self.post('/charts/historical', payload))
+
+        d = one(start, end)
+        if d is None or len(d) < 150:
+            frames, cur = ([d] if d is not None else []), start
+            while cur < end:
+                nxt = min(cur + timedelta(days=85), end)
+                f = one(cur, nxt)
+                if f is not None:
+                    frames.append(f)
+                cur = nxt
+            d = pd.concat(frames) if frames else None
+        if d is None or d.empty:
+            raise ValueError('No candles returned (check instrument mapping / token / date range)')
+        d = d.sort_index()
+        return d[~d.index.duplicated(keep='last')]
+
+    def expiries(self, sid, segment):
+        return self.post('/optionchain/expirylist', {'UnderlyingScrip': int(sid), 'UnderlyingSeg': segment},
+                         EXPIRY_LIMITER, with_client=True)
+
+    def chain(self, sid, segment, expiry):
+        return self.post('/optionchain', {'UnderlyingScrip': int(sid), 'UnderlyingSeg': segment, 'Expiry': expiry},
+                         CHAIN_LIMITER, with_client=True)
+
+
+class DailyCache:
+    """Thread-safe in-memory candle cache (survives reruns, shared via st.cache_resource)."""
+    def __init__(self):
+        self.lock, self.data = threading.Lock(), {}
+
+    def get(self, key, ttl=21600):
+        with self.lock:
+            v = self.data.get(key)
+        return v[1] if v and time.time() - v[0] < ttl else None
+
+    def put(self, key, value):
+        with self.lock:
+            self.data[key] = (time.time(), value)
+            if len(self.data) > 1500:
+                for k in sorted(self.data, key=lambda z: self.data[z][0])[:300]:
+                    self.data.pop(k, None)
+
+
+@st.cache_resource
+def get_cache():
+    return DailyCache()
+
+
+@st.cache_resource
+def get_scan_store():
+    return {}
+
+
+def load_daily(api, cache, x, cutoff, force=False):
+    key = (x['sid'], x['segment'], x['instrument'], cutoff.isoformat())
+    if not force:
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+    end = pd.Timestamp(cutoff) + timedelta(days=1)
+    df = api.daily(x['sid'], x['segment'], x['instrument'], end - timedelta(days=420), end)
+    df = df[df.index.date <= cutoff]
+    # Index spot candles carry no volume -> use near-month index-futures volume as proxy (flagged in output).
+    if x['instrument'] == 'INDEX' and df.Volume.tail(25).sum() <= 0 and str(x.get('fut_sid', '')).isdigit():
         try:
-            with st.spinner('Loading instrument master…'):
-                master = cached_master()
-                universe = build_universe(master)
-                if universe.empty: raise ValueError('No matched F&O equities. Dhan master schema or symbol matching needs adjustment; inspect source CSV.')
-                st.session_state.master = master
-                st.session_state.universe = universe
-            st.success(f'Found {len(universe)} F&O equity underlyings. Please review symbols before scanning.')
-        except Exception as e: st.error(str(e))
-    u = st.session_state.universe
-    if not u.empty:
-        st.write(f'{len(u)} F&O equity underlyings identified from current master')
-        st.dataframe(u.head(25), use_container_width=True, hide_index=True)
-    st.info('First scan downloads historical candles (approximately 5 requests per stock); repeat scans reuse cached candles for 6 hours. Dhan API limits still apply. Scan in batches.')
-    offset = st.number_input('Start at stock number', 1, 1000, 1, 10)
-    st.caption('Stock numbering starts at 1. The universe is loaded automatically.')
-    if st.button('Scan selected batch', disabled=not token, type='primary'):
-        cached_flows.clear()  # fresh public-data attempt on each explicit scan
-        try:
-            flows = cached_flows()
-            flow_error = None
-        except Exception as exc:
-            flows = None
-            flow_error = str(exc)
-        api = DhanAPI(token, client_id=client_id)
-        today = date.today()
-        stocks = [] if u.empty else u.iloc[int(offset)-1:int(offset)-1+int(scan_limit)].to_dict('records')
-        if index_vol:
-            stocks = [{'symbol':'NIFTY','sid':'13','segment':'IDX_I','instrument':'INDEX'},
-                      {'symbol':'BANKNIFTY','sid':'25','segment':'IDX_I','instrument':'INDEX'}] + stocks
-        if not stocks: st.warning('Load instrument master first, or enable indices.')
+            fut = api.daily(x['fut_sid'], 'NSE_FNO', 'FUTIDX', end - timedelta(days=150), end)
+            df = df.copy()
+            df['Volume'] = fut['Volume'].reindex(df.index).fillna(0)
+            df.attrs['vol_src'] = 'index futures proxy'
+        except Exception:
+            pass
+    cache.put(key, df)
+    return df
+
+
+# ---- instrument master -> F&O universe ------------------------------------------------
+def read_instrument_master():
+    r = requests.get(MASTER_URL, timeout=120, headers={'User-Agent': 'Mozilla/5.0'})
+    r.raise_for_status()
+    keep = []
+    for ch in pd.read_csv(io.BytesIO(r.content), dtype=str, chunksize=50000):
+        ch.columns = [str(c).strip().upper() for c in ch.columns]
+        icol = next((c for c in ('INSTRUMENT', 'INSTRUMENT_TYPE', 'SEM_INSTRUMENT_NAME') if c in ch.columns), None)
+        if icol is None:
+            keep.append(ch)
         else:
-            results=[]; history=[]; errors=[]
-            started = time.monotonic()
-            progress = st.progress(0, text='Starting scan')
-            for i, x in enumerate(stocks):
-                try:
-                    stock_started = time.monotonic()
-                    # ~350 calendar days for EMA200 warm-up, 85-day bounded Dhan requests.
-                    daily = cached_daily(token, client_id, x['sid'], x['segment'], x['instrument'], today.isoformat())
-                    if len(daily) < 220: raise ValueError(f'Only {len(daily)} candles (need 220+)')
-                    cfg = dict(config)
-                    cfg['event_blackout_dates'] = {x['symbol']:blackouts}
-                    d = annotate(indicators(daily), cfg, x['symbol'])
-                    d = d[d.index.date < today]  # only completed prior trading days
-                    if d.empty: raise ValueError('No completed daily candles')
-                    r = d.iloc[-1]
-                    volok = bool(r.Volume > 0 and r.vol20 > 0)
-                    latest_signal = r.signal if volok else ''
-                    side = latest_signal or ('CE' if score(r,'CE') >= score(r,'PE') else 'PE')
-                    best = score(r,side)
-                    eligible = bool(latest_signal and best >= min_score)
-                    direction = 1 if side == 'CE' else -1
-                    entry = float(r.Close)
-                    risk = float(r.atr) * 1.5
-                    reasons = rejection_reasons(r, side, cfg, x['symbol'], volok)
-                    month_rows = d[d.index.to_period('M') == d.index[-1].to_period('M')]
-                    month_open = float(month_rows.iloc[0].Open) if len(month_rows) else float(r.Close)
-                    mtd = (float(r.Close) / month_open - 1) * 100 if month_open > 0 else float('nan')
-                    crosses_up = month_rows.index[month_rows.cross_up.fillna(False)]
-                    crosses_down = month_rows.index[month_rows.cross_down.fillna(False)]
-                    breakouts_up = month_rows.index[month_rows.break_up.fillna(False)]
-                    breakouts_down = month_rows.index[month_rows.break_down.fillna(False)]
-                    monthly_events = (crosses_up.union(breakouts_up) if side == 'CE' else crosses_down.union(breakouts_down))
-                    last_trigger = monthly_events[-1].strftime('%Y-%m-%d') if len(monthly_events) else ''
-                    directional = bool((r.Close > r.ema200 and r.st_dir == 1 and r.rsi > 55 and r.pdi > r.mdi) if side == 'CE' else (r.Close < r.ema200 and r.st_dir == -1 and r.rsi < 45 and r.mdi > r.pdi))
-                    monthly_trend = 'BULLISH' if (r.Close > r.ema50 and mtd > 0 and r.st_dir == 1) else ('BEARISH' if (r.Close < r.ema50 and mtd < 0 and r.st_dir == -1) else 'SIDEWAYS/MIXED')
-                    consistent = (monthly_trend == ('BULLISH' if side == 'CE' else 'BEARISH'))
-                    hard_blocks = []
-                    if not volok or not bool(r.Volume > r.vol20): hard_blocks.append('Volume unconfirmed')
-                    if pd.isna(r.cpr_width) or r.cpr_width > cpr_width: hard_blocks.append('CPR too wide')
-                    if pd.isna(r.adx) or r.adx <= 22: hard_blocks.append('ADX too low')
-                    if not directional: hard_blocks.append('Trend / RSI / DI disagreement')
-                    if not consistent: hard_blocks.append('Monthly trend disagreement')
-                    if any(abs((d.index[-1].date()-pd.Timestamp(e).date()).days)<=3 for e in blackouts): hard_blocks.append('Event blackout')
-                    status = 'FRESH ENTRY' if eligible and not hard_blocks else ('MONTHLY TRIGGER WATCH' if best >= 8 and last_trigger and not hard_blocks else ('STRONG WATCHLIST' if best >= 8 and directional else 'REJECTED'))
-                    row = {'Symbol':x['symbol'],'Date':d.index[-1].strftime('%Y-%m-%d'),
-                           'Side':side,'Score':int(best),'Eligible':bool(status == 'FRESH ENTRY'),'Status':status,'Monthly trend':monthly_trend,'MTD %':round(mtd,2),'Last monthly trigger':last_trigger,'Monthly trigger':bool(last_trigger),'Hard blocks':'; '.join(hard_blocks),'FII net ₹Cr (market)':flows['fii_net'] if flows else None,'DII net ₹Cr (market)':flows['dii_net'] if flows else None,'Flow date':flows['date'] if flows else '', 'FII 5D ₹Cr':flows['fii_5d'] if flows else None,'DII 5D ₹Cr':flows['dii_5d'] if flows else None,'FII MTD ₹Cr':flows['fii_mtd'] if flows else None,'DII MTD ₹Cr':flows['dii_mtd'] if flows else None,'Institutional sentiment':flows['sentiment'] if flows else 'UNAVAILABLE', 'Close':entry,
-                           'Underlying SL':entry-direction*risk,'Target 1 (1R)':entry+direction*risk,
-                           'Target 2 (2R)':entry+direction*2*risk,
-                           'ADX':float(r.adx),'RSI':float(r.rsi),'Volume OK':volok,
-                           'Weekly CPR width %':float(r.cpr_width)*100 if pd.notna(r.cpr_width) else None,
-                           'Reason': 'Eligible daily signal' if status == 'FRESH ENTRY' else '; '.join(reasons),
-                           'Failed gates':len(reasons), 'Load seconds':round(time.monotonic()-stock_started,2)}
-                    results.append(row)
-                    for dt, s in d.tail(scan_days).iterrows():
-                        if s.signal:
-                            history.append({'Symbol':x['symbol'],'Date':dt.strftime('%Y-%m-%d'), 'Side':s.signal,'Score':int(s.score), 'Close':float(s.Close)})
-                except Exception as e:
-                    errors.append({'Symbol':x['symbol'],'Error':str(e)})
-                progress.progress((i+1)/len(stocks),text=f'Processed {i+1}/{len(stocks)}: {x["symbol"]}')
-            if results:
-                new = pd.DataFrame(results)
-                prior = st.session_state.scan
-                st.session_state.scan = pd.concat([prior[~prior.Symbol.isin(new.Symbol)],new],ignore_index=True) if not prior.empty else new
-                st.session_state.scan['Rank'] = st.session_state.scan.Status.map({'FRESH ENTRY':0,'MONTHLY TRIGGER WATCH':1,'STRONG WATCHLIST':2,'REJECTED':3}).fillna(4)
-                st.session_state.scan = st.session_state.scan.sort_values(['Rank','Score','ADX'],ascending=[True,False,False]).drop(columns=['Rank']).reset_index(drop=True)
-                st.session_state.history = pd.concat([st.session_state.history,pd.DataFrame(history)],ignore_index=True).drop_duplicates(['Symbol','Date','Side']) if history else st.session_state.history
-                st.success(f'Scanned {len(results)} instruments in {time.monotonic()-started:.1f}s; {int(new.Eligible.sum())} eligible. Previous batches retained in this session.')
-            st.session_state.scan_errors = pd.DataFrame(errors)
-            if errors: st.warning(f'{len(errors)} instruments failed'); st.dataframe(pd.DataFrame(errors),hide_index=True)
-            if errors: st.download_button('Download API errors CSV',pd.DataFrame(errors).to_csv(index=False),file_name='dhan_api_errors.csv')
-    st.subheader('Moneycontrol institutional cash flows')
-    if flows:
-        st.caption(f"Published as of {flows['date']}; refreshes on every Scan selected batch. Not live intraday data. Market-wide, not individual-stock flows.")
-        f1,f2,f3 = st.columns(3)
-        f1.metric('FII net ₹Cr (latest)', f"{flows['fii_net']:+,.2f}")
-        f2.metric('DII net ₹Cr (latest)', f"{flows['dii_net']:+,.2f}")
-        f3.metric('5-session sentiment', flows['sentiment'])
-        st.dataframe(pd.DataFrame(flows['rows']), use_container_width=True, hide_index=True)
-        st.link_button('Moneycontrol source', flows['source'])
-    else:
-        st.warning('Institutional data unavailable. This is not a zero-flow reading. ' + (flow_error or ''))
-    st.caption('Institutional cash flows provide contextual market sentiment; they do not override technical entry gates or establish stock-specific buying.')
-    if not st.session_state.scan.empty:
-        st.caption('Only the latest completed daily candle is eligible for a new entry; prior signals are historical.')
-        st.subheader('Latest batch results — eligible first')
-        st.dataframe(st.session_state.scan, use_container_width=True, hide_index=True)
-        st.download_button('Download scanner CSV',st.session_state.scan.to_csv(index=False).encode(),file_name='dhan_scan.csv')
+            keep.append(ch[ch[icol].fillna('').str.upper().isin(['EQUITY', 'EQ', 'FUTSTK', 'FUTIDX', 'FUT'])])
+    return pd.concat(keep, ignore_index=True)
 
-with t2:
-    d = st.session_state.scan
-    if d.empty: st.info('Run a market scan first.')
-    else:
-        current = d[d.Eligible].sort_values(['Score','ADX'],ascending=[False,False])
-        st.metric('Eligible current daily setups',len(current))
-        if current.empty: st.warning('No eligible trades in scanned batch. Do not force a trade.')
-        else: st.dataframe(current,use_container_width=True,hide_index=True)
-        st.subheader('Monthly-trigger candidates (score ≥ 8)')
-        st.dataframe(d[d.Status == 'MONTHLY TRIGGER WATCH'],use_container_width=True,hide_index=True)
-        st.subheader('Strong watchlist (score ≥ 8)')
-        st.dataframe(d[d.Status == 'STRONG WATCHLIST'],use_container_width=True,hide_index=True)
-        with st.expander('Rejected candidates and failed conditions'):
-            st.dataframe(d[d.Status == 'REJECTED'],use_container_width=True,hide_index=True)
-        st.info('Monthly-trigger watchlist means a crossover/breakout occurred this month, NOT that entry is safe now. Fresh entry additionally needs current confirmation. Option-chain expiry, IV, spread and OI must be checked manually before paper option entry.')
-        st.caption('Historical signals from selected lookback are not fresh entries; see below.')
-        if not st.session_state.history.empty: st.dataframe(st.session_state.history.sort_values('Date',ascending=False),use_container_width=True,hide_index=True)
 
-with t3:
-    d=st.session_state.scan
-    if d.empty: st.info('Run the scanner to select an instrument.')
-    else:
-        chosen = st.selectbox('Instrument',d.Symbol.tolist())
-        r=d[d.Symbol==chosen].iloc[0]
-        st.dataframe(pd.DataFrame([r]),hide_index=True,use_container_width=True)
-        st.warning('Entry, SL and targets are underlying reference levels, NOT option premium prices. No strike, expiry, premium, lot size or rupee risk can be confirmed without a validated option chain.')
-        if token:
-            st.subheader('Option chain — manual inspection')
-            api = DhanAPI(token, client_id=client_id)
-            mapping = {'NIFTY':('13','IDX_I'),'BANKNIFTY':('25','IDX_I')}
-            if chosen in mapping: sid,seg=mapping[chosen]
-            else:
-                u=st.session_state.universe
-                match=u[u.symbol==chosen]
-                sid,seg=(str(match.iloc[0].sid),'NSE_EQ') if not match.empty else ('','NSE_EQ')
-            if st.button('Get available expiries'):
-                try: st.json(api.expiries(sid,seg))
-                except Exception as e: st.error(str(e))
-            expiry=st.text_input('Expiry YYYY-MM-DD (from expiry list)')
-            if st.button('Get option chain') and expiry:
-                try: st.json(api.chain(sid,seg,expiry),expanded=False)
-                except Exception as e: st.error(str(e))
+def _col(m, names):
+    for n in names:
+        if n in m.columns:
+            return m[n]
+    return None
 
-with t4:
-    st.subheader('Paper trading journal')
-    st.caption('This records UNDERLYING reference-point movements, not actual CE/PE option P&L. No orders are sent.')
-    st.warning('Streamlit Cloud session data can disappear on app restart. Export CSV regularly and re-import to restore your journal.')
-    import_csv=st.file_uploader('Restore paper trades CSV',type='csv',key='paper_import')
-    if import_csv and st.button('Import paper trades'):
+
+def build_universe(master):
+    """Returns (stocks_df, indices_df). stocks: symbol,sid,segment,instrument,lot."""
+    m = master.copy()
+    m.columns = [str(c).strip().upper() for c in m.columns]
+    aliases = {'EXCH_ID': ['EXCH_ID', 'SEM_EXM_EXCH_ID'], 'SEGMENT': ['SEGMENT', 'SEM_SEGMENT'],
+               'SECURITY_ID': ['SECURITY_ID', 'SEM_SMST_SECURITY_ID'],
+               'INSTRUMENT': ['INSTRUMENT', 'INSTRUMENT_TYPE', 'SEM_INSTRUMENT_NAME'],
+               'SYMBOL_NAME': ['SYMBOL_NAME', 'SEM_TRADING_SYMBOL', 'DISPLAY_NAME']}
+    for canon, variants in aliases.items():
+        src = _col(m, variants)
+        if src is None:
+            raise ValueError(f'Dhan master missing {canon}; available columns: {list(m.columns)}')
+        m[canon] = src
+    lot = _col(m, ['LOT_SIZE', 'SEM_LOT_UNITS'])
+    exp = _col(m, ['SM_EXPIRY_DATE', 'SEM_EXPIRY_DATE', 'EXPIRY_DATE'])
+    m['LOT'] = pd.to_numeric(lot, errors='coerce') if lot is not None else np.nan
+    m['EXP'] = pd.to_datetime(exp, errors='coerce') if exp is not None else pd.NaT
+    for c in ('EXCH_ID', 'SEGMENT', 'INSTRUMENT'):
+        m['_' + c] = m[c].fillna('').astype(str).str.upper().str.strip()
+    nse = m['_EXCH_ID'].eq('NSE') | m['_SEGMENT'].str.contains('NSE')
+    inst = m['_INSTRUMENT']
+    today = pd.Timestamp.now().normalize() - timedelta(days=1)
+
+    # ---- stock futures define the F&O stock list
+    fut = m[nse & (inst.str.contains('FUTSTK') | ((inst == 'FUT') & m['_SEGMENT'].str.contains('FNO|F&O|DERIV|^D$')))].copy()
+    if fut.empty:
+        raise ValueError('No NSE stock futures found in Dhan master.')
+    if 'UNDERLYING_SYMBOL' in fut.columns:
+        fut['key'] = fut['UNDERLYING_SYMBOL'].fillna('').str.upper().str.strip()
+    else:
+        fut['key'] = fut['SYMBOL_NAME'].fillna('').str.upper().str.replace(r'[- ]?\d{2}[A-Z]{3}FUT$', '', regex=True).str.strip()
+    fut = fut[~fut['key'].str.contains(r'TEST|DUMMY|MOCK', case=False, na=False)]
+    live = fut[fut['EXP'].isna() | (fut['EXP'] >= today)].sort_values('EXP')
+    lot_map = live.groupby('key')['LOT'].first().to_dict()
+    keys = set(fut['key']) - {''}
+
+    # ---- spot equity IDs (candles must use the NSE_EQ id, not the futures id)
+    eq = m[(m['_EXCH_ID'].eq('NSE') | m['_SEGMENT'].eq('NSE_EQ')) &
+           (inst.isin(['EQUITY', 'EQ']) | m['_SEGMENT'].eq('NSE_EQ'))].copy()
+    eq['key'] = eq['SYMBOL_NAME'].fillna('').str.upper().str.strip()
+    if 'UNDERLYING_SYMBOL' in eq.columns:
+        eq['key'] = eq['UNDERLYING_SYMBOL'].where(eq['UNDERLYING_SYMBOL'].fillna('').ne(''), eq['key']).astype(str).str.upper().str.strip()
+    eq = eq[eq['key'].isin(keys)]
+    if 'SERIES' in eq.columns:
+        eq = eq[eq['SERIES'].fillna('EQ').astype(str).str.upper().isin(['EQ', ''])]
+    eq = eq.drop_duplicates('key')
+    stocks = pd.DataFrame({'symbol': eq['key'], 'sid': eq['SECURITY_ID'].astype(str).str.replace(r'\.0$', '', regex=True),
+                           'segment': 'NSE_EQ', 'instrument': 'EQUITY'})
+    stocks['lot'] = stocks['symbol'].map(lot_map)
+    stocks = stocks[stocks['sid'].str.fullmatch(r'\d+') & stocks['symbol'].str.fullmatch(r'[A-Z0-9&._-]{2,40}')]
+    stocks = stocks[~stocks['symbol'].str.contains(r'TEST|DUMMY|MOCK', case=False)].sort_values('symbol').reset_index(drop=True)
+    if stocks.empty:
+        raise ValueError(f'Found {len(keys)} F&O symbols but no matching NSE equity IDs.')
+
+    # ---- indices (+ near-month index future: lot size and volume proxy)
+    ifut = m[nse & inst.eq('FUTIDX')].copy()
+    ifut['key'] = (ifut['UNDERLYING_SYMBOL'] if 'UNDERLYING_SYMBOL' in ifut.columns else ifut['SYMBOL_NAME']).fillna('').str.upper().str.strip()
+    ifut = ifut[ifut['EXP'].isna() | (ifut['EXP'] >= today)].sort_values('EXP').drop_duplicates('key')
+    imap = ifut.set_index('key')
+    rows = []
+    for name, sid in INDEX_IDS.items():
+        has = name in imap.index
+        rows.append({'symbol': name, 'sid': sid, 'segment': 'IDX_I', 'instrument': 'INDEX',
+                     'lot': imap.loc[name, 'LOT'] if has else np.nan,
+                     'fut_sid': str(imap.loc[name, 'SECURITY_ID']).replace('.0', '') if has else ''})
+    return stocks, pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_universe():
+    return build_universe(read_instrument_master())
+
+
+# =====================================================================================
+# 2. INDICATORS, SCORING, MONTHLY ANALYSIS
+# =====================================================================================
+def ema(s, n): return s.ewm(span=n, adjust=False, min_periods=n).mean()
+def rma(s, n): return s.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+
+
+def atr(df, n=14):
+    p = df.Close.shift(1)
+    tr = pd.concat([(df.High - df.Low), (df.High - p).abs(), (df.Low - p).abs()], axis=1).max(axis=1)
+    return rma(tr, n)
+
+
+def indicators(df):
+    d = df.copy().sort_index()
+    for n in (9, 21, 50, 200):
+        d[f'ema{n}'] = ema(d.Close, n)
+    d['atr'] = atr(d)
+    up, down = d.High.diff(), -d.Low.diff()
+    plus = up.where((up > down) & (up > 0), 0.0)
+    minus = down.where((down > up) & (down > 0), 0.0)
+    trsum = d['atr'] * 14
+    pdi = 100 * rma(plus, 14) * 14 / trsum.replace(0, np.nan)
+    mdi = 100 * rma(minus, 14) * 14 / trsum.replace(0, np.nan)
+    d['pdi'], d['mdi'] = pdi, mdi
+    d['adx'] = rma(100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan), 14)
+    diff = d.Close.diff()
+    gain, loss = rma(diff.clip(lower=0), 14), rma((-diff).clip(lower=0), 14)
+    d['rsi'] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+    d.loc[(loss == 0) & (gain > 0), 'rsi'] = 100
+    d.loc[(loss == 0) & (gain == 0), 'rsi'] = 50
+    mid = (d.High + d.Low) / 2
+    upper, lower = mid + 3 * d['atr'], mid - 3 * d['atr']
+    st_line, direction = np.full(len(d), np.nan), np.zeros(len(d), dtype=int)
+    fu, fl, close = upper.to_numpy().copy(), lower.to_numpy().copy(), d.Close.to_numpy()
+    midv = mid.to_numpy()
+    for i in range(1, len(d)):
+        if np.isnan(fu[i]) or np.isnan(fu[i - 1]):
+            continue
+        if fu[i] >= fu[i - 1] and close[i - 1] <= fu[i - 1]: fu[i] = fu[i - 1]
+        if fl[i] <= fl[i - 1] and close[i - 1] >= fl[i - 1]: fl[i] = fl[i - 1]
+        if direction[i - 1] == 0: direction[i] = 1 if close[i] >= midv[i] else -1
+        elif direction[i - 1] == 1: direction[i] = -1 if close[i] < fl[i] else 1
+        else: direction[i] = 1 if close[i] > fu[i] else -1
+        st_line[i] = fl[i] if direction[i] == 1 else fu[i]
+    d['st'], d['st_dir'] = st_line, direction
+    d['vol20'] = d.Volume.rolling(20).mean().shift(1)
+    # prior COMPLETED weekly OHLC only (never the running week)
+    weekly = d[['High', 'Low', 'Close']].resample('W-FRI').agg({'High': 'max', 'Low': 'min', 'Close': 'last'}).shift(1)
+    w = weekly.reindex(d.index, method='ffill')
+    pivot = (w.High + w.Low + w.Close) / 3
+    bc = (w.High + w.Low) / 2
+    tc = 2 * pivot - bc
+    d['cpr_top'] = pd.concat([bc, tc], axis=1).max(axis=1)
+    d['cpr_bottom'] = pd.concat([bc, tc], axis=1).min(axis=1)
+    d['cpr_width'] = (d.cpr_top - d.cpr_bottom) / pivot
+    span = w.High - w.Low
+    d['r3'], d['s3'] = w.Close + span * 1.1 / 4, w.Close - span * 1.1 / 4
+    up_lvl = d[['cpr_top', 'r3']].max(axis=1)
+    dn_lvl = d[['cpr_bottom', 's3']].min(axis=1)
+    d['cross_up'] = (d.ema9 > d.ema21) & (d.ema9.shift(1) <= d.ema21.shift(1))
+    d['cross_down'] = (d.ema9 < d.ema21) & (d.ema9.shift(1) >= d.ema21.shift(1))
+    d['break_up'] = (d.Close > up_lvl) & (d.Close.shift(1) <= up_lvl.shift(1))
+    d['break_down'] = (d.Close < dn_lvl) & (d.Close.shift(1) >= dn_lvl.shift(1))
+    return d
+
+
+def _side_tests(d, side, validvol):
+    bull = side == 'CE'
+    t = {
+        'ema200': (d.Close > d.ema200) if bull else (d.Close < d.ema200),
+        'ema50': (d.ema50 > d.ema200) if bull else (d.ema50 < d.ema200),
+        'st': d.st_dir == (1 if bull else -1),
+        'adx': d.adx > 22,
+        'adx_rise': d.adx > d.prev_adx,
+        'di': (d.pdi > d.mdi) if bull else (d.mdi > d.pdi),
+        'trigger': (d.cross_up | d.break_up) if bull else (d.cross_down | d.break_down),
+        'rsi': (d.rsi > 55) if bull else (d.rsi < 45),
+        'volume': validvol & (d.Volume > d.vol20),
+        'ema21': (d.Close > d.ema21) if bull else (d.Close < d.ema21),
+    }
+    return {k: v.fillna(False).astype(bool) for k, v in t.items()}
+
+
+def annotate(d, cfg, ticker):
+    """Vectorised 10-point score + strict daily signal (all mandatory gates)."""
+    d = d.copy()
+    d['prev_adx'] = d.adx.shift(1)
+    validvol = (d.Volume > 0) & (d.vol20 > 0)
+    bl = pd.Series(False, index=d.index)
+    for e in cfg.get('event_blackout_dates', {}).get(ticker, []):
+        bl |= pd.Series(np.abs((d.index - pd.Timestamp(e).normalize()).days) <= 3, index=d.index)
+    common = (d.ema200.notna() & d.adx.notna() & (d.adx >= 20) & d.cpr_width.notna() &
+              (d.cpr_width <= cfg['max_weekly_cpr_width']) & validvol & ~bl)
+    out = {}
+    for side in ('CE', 'PE'):
+        t = _side_tests(d, side, validvol)
+        d[f'score_{side}'] = sum(v.astype(int) for v in t.values())
+        out[side] = t['ema200'] & t['st'] & t['adx'] & t['adx_rise'] & t['di'] & t['trigger'] & t['rsi'] & t['volume']
+    d['side'] = np.where(d.score_CE > d.score_PE, 'CE', np.where(d.score_PE > d.score_CE, 'PE',
+                         np.where(d.st_dir == 1, 'CE', 'PE')))
+    d['score'] = np.where(d.side == 'CE', d.score_CE, d.score_PE)
+    ok = np.where(d.side == 'CE', out['CE'], out['PE']) & common & (d.score >= cfg['min_score'])
+    d['signal'] = np.where(ok, d.side, '')
+    return d
+
+
+def rejection_reasons(r, side, cfg):
+    bull = side == 'CE'
+    reasons = []
+
+    def chk(cond, label):
+        if not bool(cond): reasons.append(label)
+    chk(pd.notna(r.ema200) and ((r.Close > r.ema200) if bull else (r.Close < r.ema200)), 'Price on wrong side of EMA200')
+    chk(r.st_dir == (1 if bull else -1), 'Supertrend against')
+    chk(pd.notna(r.adx) and r.adx > 22, 'ADX <= 22')
+    chk(pd.notna(r.prev_adx) and r.adx > r.prev_adx, 'ADX not rising')
+    chk((r.pdi > r.mdi) if bull else (r.mdi > r.pdi), '+DI/-DI against')
+    chk(bool(r.cross_up or r.break_up) if bull else bool(r.cross_down or r.break_down), 'No trigger today')
+    chk((r.rsi > 55) if bull else (r.rsi < 45), 'RSI not confirming')
+    chk(r.Volume > 0 and r.vol20 > 0 and r.Volume > r.vol20, 'Volume not above 20d average')
+    chk(pd.notna(r.cpr_width) and r.cpr_width <= cfg['max_weekly_cpr_width'], 'Weekly CPR too wide')
+    return reasons
+
+
+def flow_bias(side, fii, dii):
+    if fii is None or dii is None:
+        return 'unknown', False
+    if fii > 0 and dii > 0: label = 'FII+DII buying'
+    elif fii < 0 and dii < 0: label = 'FII+DII selling'
+    else: label = f"mixed (FII {'+' if fii > 0 else '-'}, DII {'+' if dii > 0 else '-'})"
+    return label, (side == 'CE' and label == 'FII+DII selling') or (side == 'PE' and label == 'FII+DII buying')
+
+
+def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0):
+    sym = x['symbol']
+    if len(daily) < 215:
+        raise ValueError(f'Only {len(daily)} candles (need 215+)')
+    d = annotate(indicators(daily), cfg, sym)
+    if d.empty or pd.isna(d.iloc[-1].ema200):
+        raise ValueError('Indicators unavailable on latest candle')
+    r = d.iloc[-1]
+    side = r.signal or r.side
+    best = int(r.score_CE if side == 'CE' else r.score_PE)
+    bull = side == 'CE'
+    volavail = bool(r.Volume > 0 and r.vol20 > 0)
+    volok = bool(volavail and r.Volume > r.vol20)
+    entry, risk = float(r.Close), float(r.atr) * 1.5
+    direction = 1 if bull else -1
+
+    mr = d[d.index.to_period('M') == d.index[-1].to_period('M')]
+    month_open = float(mr.iloc[0].Open)
+    mtd = (entry / month_open - 1) * 100 if month_open > 0 else np.nan
+    trig_mask = (mr.cross_up | mr.break_up) if bull else (mr.cross_down | mr.break_down)
+    ev = mr[trig_mask]
+    last_trigger = ''
+    if len(ev):
+        e = ev.iloc[-1]
+        crossed = bool(e.cross_up if bull else e.cross_down)
+        broke = bool(e.break_up if bull else e.break_down)
+        kind = 'EMA9/21 cross + CPR breakout' if crossed and broke else ('EMA9/21 cross' if crossed else 'Weekly CPR/R3 breakout')
+        last_trigger = f"{ev.index[-1].strftime('%Y-%m-%d')} {kind}"
+
+    directional = bool((r.Close > r.ema200 and r.st_dir == 1 and r.rsi > 55 and r.pdi > r.mdi) if bull else
+                       (r.Close < r.ema200 and r.st_dir == -1 and r.rsi < 45 and r.mdi > r.pdi))
+    monthly_trend = ('BULLISH' if (r.Close > r.ema50 and mtd > 0 and r.st_dir == 1) else
+                     ('BEARISH' if (r.Close < r.ema50 and mtd < 0 and r.st_dir == -1) else 'SIDEWAYS/MIXED'))
+    consistent = monthly_trend == ('BULLISH' if bull else 'BEARISH')
+    fbias, fopp = flow_bias(side, fii, dii)
+    ext_atr = abs(r.Close - r.ema21) / r.atr if r.atr > 0 else np.nan
+    extended = bool(pd.notna(ext_atr) and ext_atr > cfg['max_ext_atr'])
+
+    blocks = []
+    if not volavail: blocks.append('No volume data')
+    elif not volok: blocks.append('Volume below 20d avg')
+    if pd.isna(r.cpr_width) or r.cpr_width > cfg['max_weekly_cpr_width']: blocks.append('Weekly CPR too wide')
+    if pd.isna(r.adx) or r.adx <= 22: blocks.append('ADX <= 22')
+    elif pd.isna(r.prev_adx) or r.adx <= r.prev_adx: blocks.append('ADX not rising')
+    if not directional: blocks.append('Trend/RSI/DI disagree')
+    if cfg['require_monthly'] and not consistent: blocks.append('Monthly trend disagrees')
+    if any(abs((d.index[-1] - pd.Timestamp(e).normalize()).days) <= 3 for e in cfg.get('event_blackout_dates', {}).get(sym, [])):
+        blocks.append('Event blackout')
+    if cfg['flow_gate'] and fopp: blocks.append('FII+DII flow opposes')
+
+    fresh = bool(r.signal) and best >= cfg['min_score'] and not blocks
+    month_ok = (not fresh) and best >= cfg['month_min_score'] and bool(last_trigger) and not blocks and not extended
+    status = ('FRESH ENTRY' if fresh else 'MONTH SETUP' if month_ok else
+              'WATCHLIST' if (best >= cfg['month_min_score'] and directional) else 'REJECTED')
+    if status == 'WATCHLIST' and extended:
+        blocks.append(f'Extended {ext_atr:.1f} ATR from EMA21')
+    reasons = rejection_reasons(r, side, cfg)
+    row = {
+        'Symbol': sym, 'Date': d.index[-1].strftime('%Y-%m-%d'), 'Side': side, 'Score': best,
+        'Status': status, 'Eligible': status in ('FRESH ENTRY', 'MONTH SETUP'),
+        'Monthly trend': monthly_trend, 'MTD %': round(mtd, 2), 'Month trigger': last_trigger,
+        'Close': round(entry, 2), 'Underlying SL': round(entry - direction * risk, 2),
+        'Target 1 (1R)': round(entry + direction * risk, 2), 'Target 2 (2R)': round(entry + direction * 2 * risk, 2),
+        'ADX': round(float(r.adx), 1), 'RSI': round(float(r.rsi), 1),
+        'CPR width %': round(float(r.cpr_width) * 100, 2) if pd.notna(r.cpr_width) else None,
+        'Volume OK': volok, 'Volume source': daily.attrs.get('vol_src', 'spot/equity'),
+        'Flow bias (market)': fbias, 'Hard blocks': '; '.join(dict.fromkeys(blocks)),
+        'Today gates failed': '; '.join(reasons) if status != 'FRESH ENTRY' else '',
+        'Lot size': x.get('lot'), 'Load sec': round(secs, 2),
+        'sid': x['sid'], 'segment': x['segment'], 'instrument': x['instrument'],
+    }
+    hist = [{'Symbol': sym, 'Date': dt.strftime('%Y-%m-%d'), 'Side': s.signal, 'Score': int(s.score), 'Close': float(s.Close)}
+            for dt, s in d.tail(cfg['scan_days']).iterrows() if s.signal]
+    return row, hist
+
+
+# =====================================================================================
+# 3. OPTIONS: expiry, strike, sizing, costs
+# =====================================================================================
+def pick_monthly_expiry(expiries, min_days, today=None):
+    today = today or datetime.now(IST).date()
+    dates = sorted({pd.Timestamp(e).date() for e in expiries})
+    last = {}
+    for dt in dates:
+        last[(dt.year, dt.month)] = dt            # ascending -> keeps month-end expiry
+    monthly = sorted(dt for dt in last.values() if dt.day >= 22)   # month-end expiry always falls on day 22+
+    ok = [dt for dt in monthly if (dt - today).days >= min_days]
+    return (ok[0] if ok else None), monthly
+
+
+def parse_chain(resp):
+    data = resp.get('data', resp) if isinstance(resp, dict) else {}
+    spot = num(data.get('last_price'))
+    rows = []
+    for k, v in (data.get('oc') or {}).items():
+        strike = num(k)
+        for typ in ('ce', 'pe'):
+            leg = v.get(typ)
+            if not leg:
+                continue
+            g = leg.get('greeks') or {}
+            rows.append({'strike': strike, 'type': typ.upper(), 'ltp': num(leg.get('last_price')),
+                         'bid': num(leg.get('top_bid_price')), 'ask': num(leg.get('top_ask_price')),
+                         'delta': num(g.get('delta')), 'iv': num(leg.get('implied_volatility')),
+                         'oi': num(leg.get('oi')), 'volume': num(leg.get('volume'))})
+    return spot, pd.DataFrame(rows)
+
+
+def select_contract(df, side, spot, p):
+    """ATM or 1-strike ITM, |delta| in range, acceptable spread, liquid. Never forces a trade."""
+    typ = side
+    sub = df[(df.type == typ) & (df.ltp > 0)].sort_values('strike')
+    strikes = sorted(df.strike.unique())
+    if sub.empty or not strikes or not (spot > 0):
+        return None, pd.DataFrame(), 'Option chain has no priced strikes'
+    atm = min(strikes, key=lambda s: abs(s - spot))
+    i = strikes.index(atm)
+    itm = strikes[i - 1] if side == 'CE' and i > 0 else (strikes[i + 1] if side == 'PE' and i + 1 < len(strikes) else None)
+    cands = sub[sub.strike.isin([s for s in (atm, itm) if s is not None])].copy()
+    cands['where'] = np.where(cands.strike == atm, 'ATM', '1 ITM')
+    mid = (cands.ask + cands.bid) / 2
+    cands['spread %'] = np.where((cands.bid > 0) & (cands.ask > 0), (cands.ask - cands.bid) / mid * 100, np.nan)
+    cands['|delta|'] = cands.delta.abs()
+    reasons = []
+
+    def good(r):
+        if not (p['delta_lo'] <= r['|delta|'] <= p['delta_hi']): return False
+        if pd.isna(r['spread %']) or r['spread %'] > p['max_spread']: return False
+        return r.oi > 0 and r.volume > 0
+    ok = cands[cands.apply(good, axis=1)] if len(cands) else cands
+    if ok.empty:
+        for _, r in cands.iterrows():
+            why = []
+            if pd.isna(r['|delta|']) or not (p['delta_lo'] <= r['|delta|'] <= p['delta_hi']): why.append(f"delta {r['|delta|']:.2f}" if pd.notna(r['|delta|']) else 'delta missing')
+            if pd.isna(r['spread %']) or r['spread %'] > p['max_spread']: why.append('spread ' + (f"{r['spread %']:.1f}%" if pd.notna(r['spread %']) else 'n/a'))
+            if not (r.oi > 0 and r.volume > 0): why.append('no OI/volume')
+            reasons.append(f"{r['where']} {r.strike:g}: " + ', '.join(why))
+        return None, cands, 'No ATM/1-ITM strike passes delta/spread/liquidity -> ' + ' | '.join(reasons)
+    best = ok.iloc[(ok['|delta|'] - 0.575).abs().argsort()[:1]].iloc[0]
+    return best, cands, ''
+
+
+def size_position(capital, risk_pct, premium, lot, sl_frac, max_exposure_pct):
+    if not (premium > 0 and lot > 0):
+        return 0, 0.0, 0.0, 'Premium or lot size missing'
+    risk_budget = capital * risk_pct / 100
+    by_risk = math.floor(risk_budget / (premium * sl_frac * lot))
+    by_exp = math.floor(capital * max_exposure_pct / 100 / (premium * lot))
+    lots = max(0, min(by_risk, by_exp))
+    note = '' if lots >= 1 else (f'One lot costs Rs {premium * lot:,.0f} (max loss Rs {premium * sl_frac * lot:,.0f}); '
+                                  f'risk budget Rs {risk_budget:,.0f}, exposure cap Rs {capital * max_exposure_pct / 100:,.0f} -> NO TRADE')
+    return lots, lots * premium * lot, lots * premium * sl_frac * lot, note
+
+
+def option_costs(entry_prem, exit_prem, qty):
+    """Approximate Zerodha option costs (rates change - verify on your contract note)."""
+    buy, sell = entry_prem * qty, exit_prem * qty
+    turnover = buy + sell
+    brokerage = min(20.0, 0.0003 * buy) + min(20.0, 0.0003 * sell)
+    stt = 0.001 * sell
+    txn = 0.0003503 * turnover
+    sebi = 1e-6 * turnover
+    stamp = 0.00003 * buy
+    gst = 0.18 * (brokerage + txn + sebi)
+    return round(brokerage + stt + txn + sebi + stamp + gst, 2)
+
+
+def option_for_setup(api, row, p, seg_memory):
+    """Fetch expiries + chain, return a dict describing the proposed contract (or why not)."""
+    sym, side = row['Symbol'], row['Side']
+    sid = str(row['sid'])
+    segs = ['IDX_I'] if row['segment'] == 'IDX_I' else [seg_memory.get('stock', 'NSE_FNO'),
+                                                         'NSE_EQ' if seg_memory.get('stock', 'NSE_FNO') == 'NSE_FNO' else 'NSE_FNO']
+    err, expiries, seg_used = '', None, None
+    for seg in segs:
         try:
-            restored=pd.read_csv(import_csv)
-            expected=list(st.session_state.paper.columns)
-            if not set(expected).issubset(restored.columns): raise ValueError('CSV missing required paper-trade columns')
-            st.session_state.paper=restored[expected]
-            st.success(f'Restored {len(restored)} rows')
-        except Exception as e: st.error(str(e))
-    d=st.session_state.scan
-    if not d.empty:
-        eligible=d[d.Eligible]
-        if not eligible.empty:
-            sym=st.selectbox('Eligible setup to paper trade',eligible.Symbol.tolist())
-            r=eligible[eligible.Symbol==sym].iloc[0]
+            resp = api.expiries(sid, seg)
+            expiries = resp.get('data', resp) if isinstance(resp, dict) else resp
+            if expiries:
+                seg_used = seg
+                if row['segment'] != 'IDX_I': seg_memory['stock'] = seg
+                break
+        except Exception as e:
+            err = str(e)
+    base = {'Symbol': sym, 'Side': side, 'Verdict': 'SKIP', 'Note': '', 'chain_sid': sid, 'chain_seg': seg_used or ''}
+    if not expiries:
+        base['Note'] = f'Expiry list unavailable: {err or "empty"}'
+        return base
+    exp, monthlies = pick_monthly_expiry(expiries, p['min_days'])
+    if exp is None:
+        base['Note'] = f'No monthly expiry with >= {p["min_days"]} days left (monthlies: {[m.isoformat() for m in monthlies[:3]]})'
+        return base
+    try:
+        spot, chain = parse_chain(api.chain(sid, seg_used, exp.isoformat()))
+    except Exception as e:
+        base['Note'] = f'Option chain failed: {e}'
+        return base
+    pick, cands, why = select_contract(chain, side, spot or float(row['Close']), p)
+    base.update({'Expiry': exp.isoformat(), 'Days left': (exp - datetime.now(IST).date()).days, '_cand': cands})
+    if pick is None:
+        base['Note'] = why
+        return base
+    premium = float(pick.ask) if pick.ask > 0 else float(pick.ltp)
+    lot = num(row.get('Lot size'))
+    lots, outlay, maxloss, note = size_position(p['capital'], p['risk_pct'], premium, lot if lot == lot else 0, p['sl_frac'], p['max_exposure'])
+    strike = float(pick.strike)
+    delta = abs(float(pick.delta)) * (1 if side == 'CE' else -1)
+    base.update({
+        'Contract': f"{sym} {exp.strftime('%d%b%Y').upper()} {strike:g} {side}", 'Strike': strike, 'Where': pick['where'],
+        'Entry premium (ask)': round(premium, 2), 'LTP': round(float(pick.ltp), 2), 'Bid': pick.bid, 'Ask': pick.ask,
+        'Spread %': round(float(pick['spread %']), 2), 'Delta': round(delta, 3), 'IV %': round(float(pick.iv), 1) if pick.iv == pick.iv else None,
+        'OI': pick.oi, 'Volume': pick.volume, 'Lot size': lot if lot == lot else None, 'Lots': lots,
+        'Outlay Rs': round(outlay), 'Max loss Rs (SL)': round(maxloss),
+        'Premium SL': round(premium * (1 - p['sl_frac']), 2), 'Premium T1 (1R)': round(premium * (1 + p['sl_frac']), 2),
+        'Premium T2 (2R)': round(premium * (1 + 2 * p['sl_frac']), 2),
+    })
+    if lot != lot:
+        base['Note'] = 'Lot size not in Dhan master - enter it manually in the Paper tab.'
+        base['Verdict'] = 'CHECK LOT'
+    elif lots < 1:
+        base['Note'] = note
+    else:
+        base['Verdict'] = 'TRADE'
+        base['Note'] = 'IV percentile is not available from Dhan - check IV manually before real trading.'
+    return base
+
+
+# =====================================================================================
+# 4. PAPER TRADING
+# =====================================================================================
+JOURNAL_COLS = ['id', 'opened_at', 'signal_date', 'symbol', 'side', 'status', 'setup', 'score',
+                'underlying_entry', 'underlying_sl', 'underlying_t1', 'underlying_t2',
+                'contract', 'expiry', 'strike', 'lot_size', 'lots', 'entry_premium', 'entry_delta', 'entry_iv',
+                'sl_frac', 'sid', 'segment', 'instrument', 'chain_sid', 'chain_seg',
+                'stop_current', 't1_hit', 'days_held', 'last_update', 'last_underlying', 'last_premium',
+                'premium_source', 'unrealized_pnl', 'closed_at', 'exit_reason', 'exit_underlying', 'exit_premium',
+                'underlying_points', 'r_underlying', 'gross_pnl', 'costs', 'net_pnl', 'notes']
+
+
+TEXT_COLS = ['id', 'opened_at', 'signal_date', 'symbol', 'side', 'status', 'setup', 'contract', 'expiry', 'sid', 'segment',
+             'instrument', 'chain_sid', 'chain_seg', 'last_update', 'premium_source', 'closed_at', 'exit_reason', 'notes']
+
+
+def normalize_journal(df):
+    df = df.copy() if df is not None else pd.DataFrame()
+    for c in JOURNAL_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df[JOURNAL_COLS].copy()
+    for c in TEXT_COLS:                       # text columns must be object dtype (empty CSV columns load as float)
+        df[c] = df[c].astype(object)
+    for c in ('id', 'sid', 'chain_sid'):
+        df[c] = df[c].map(lambda v: v if pd.isna(v) else str(v).replace('.0', '') if str(v).endswith('.0') else str(v)).astype(object)
+    df['t1_hit'] = df['t1_hit'].map(lambda v: str(v).strip().lower() in ('true', '1', '1.0'))
+    return df.reset_index(drop=True)
+
+
+class JournalStore:
+    """Private GitHub Gist when GITHUB_TOKEN is set (permanent), else a local file (lost on app reboot)."""
+    def __init__(self, token='', gist_id=''):
+        self.token, self.gist_id = (token or '').strip(), (gist_id or '').strip()
+        self.h = {'Authorization': f'Bearer {self.token}', 'Accept': 'application/vnd.github+json'}
+
+    @property
+    def mode(self):
+        return 'gist' if self.token else 'local'
+
+    def load(self):
+        try:
+            if self.token and self.gist_id:
+                r = requests.get(f'https://api.github.com/gists/{self.gist_id}', headers=self.h, timeout=20)
+                r.raise_for_status()
+                f = r.json()['files'].get(GIST_FILE)
+                if f is None:
+                    return normalize_journal(None), 'Gist found but empty'
+                text = requests.get(f['raw_url'], headers=self.h, timeout=20).text if f.get('truncated') else f['content']
+                return normalize_journal(pd.read_csv(io.StringIO(text))), 'Loaded from GitHub Gist'
+            if os.path.exists(JOURNAL_FILE):
+                return normalize_journal(pd.read_csv(JOURNAL_FILE)), 'Loaded from local file (not permanent on Streamlit Cloud)'
+        except Exception as e:
+            return normalize_journal(None), f'Load failed: {str(e)[:150]}'
+        return normalize_journal(None), ('GITHUB_TOKEN set but PAPER_GIST_ID empty: first save creates the Gist'
+                                         if self.token else 'No saved journal yet')
+
+    def save(self, df):
+        text = normalize_journal(df).to_csv(index=False)
+        try:
+            with open(JOURNAL_FILE, 'w', encoding='utf-8') as fh:
+                fh.write(text)
+        except Exception:
+            pass
+        if not self.token:
+            return 'Saved locally only (add GITHUB_TOKEN for permanent storage)'
+        try:
+            if self.gist_id:
+                r = requests.patch(f'https://api.github.com/gists/{self.gist_id}', headers=self.h, timeout=20,
+                                   json={'files': {GIST_FILE: {'content': text}}})
+            else:
+                r = requests.post('https://api.github.com/gists', headers=self.h, timeout=20,
+                                  json={'description': 'Dhan swing options paper journal', 'public': False,
+                                        'files': {GIST_FILE: {'content': text}}})
+                if r.ok:
+                    self.gist_id = r.json()['id']
+            r.raise_for_status()
+            return f'Saved to GitHub Gist {self.gist_id}'
+        except Exception as e:
+            return f'Gist save failed (saved locally): {str(e)[:150]}'
+
+
+def model_premium(prem0, delta, u0, u):
+    """First-order estimate: premium + delta x underlying move. Ignores theta/gamma/IV change."""
+    return max(0.05, prem0 + delta * (u - u0))
+
+
+def evaluate_trade(t, d, prem_sl_frac, max_hold=10):
+    """Replay all completed daily bars after the signal date. Stateless -> safe to run repeatedly."""
+    sign = 1 if t['side'] == 'CE' else -1
+    entry, sl0, t1, t2 = (float(t[k]) for k in ('underlying_entry', 'underlying_sl', 'underlying_t1', 'underlying_t2'))
+    prem0 = num(t['entry_premium'])
+    delta = num(t['entry_delta'], 0.55 * sign) or 0.55 * sign
+    exp = pd.Timestamp(t['expiry']).date() if isinstance(t['expiry'], str) and t['expiry'] else None
+    risk_pts = abs(entry - sl0)
+    u_prem_sl = entry - prem_sl_frac * prem0 / delta if prem0 == prem0 else None   # underlying level where premium is -30%
+    stop, t1_hit, days, ex = sl0, False, 0, None
+    bars = d[d.index > pd.Timestamp(t['signal_date']).normalize()]
+    for dt, r in bars.iterrows():
+        days += 1
+        o, h, l, c = float(r.Open), float(r.High), float(r.Low), float(r.Close)
+        eff, why = stop, 'STOP-LOSS (1.5 ATR / trailed)'
+        if u_prem_sl is not None and ((sign == 1 and u_prem_sl > eff) or (sign == -1 and u_prem_sl < eff)):
+            eff, why = u_prem_sl, 'PREMIUM STOP (-30%)'
+        if (sign == 1 and l <= eff) or (sign == -1 and h >= eff):
+            px = min(eff, o) if sign == 1 else max(eff, o)
+            ex = (dt, px, why + (' gap' if px != eff else ''), 'prem_sl' if why.startswith('PREMIUM') and px == eff else 'model')
+            break
+        if (sign == 1 and h >= t2) or (sign == -1 and l <= t2):
+            ex = (dt, max(t2, o) if sign == 1 else min(t2, o), 'TARGET 2 (2R)', 'model')
+            break
+        if not t1_hit and ((sign == 1 and h >= t1) or (sign == -1 and l <= t1)):
+            t1_hit = True
+            stop = max(stop, entry) if sign == 1 else min(stop, entry)       # breakeven at 1R
+        if t1_hit and pd.notna(r.ema21):                                      # trail with EMA21
+            if sign == 1 and r.ema21 < c: stop = max(stop, float(r.ema21))
+            if sign == -1 and r.ema21 > c: stop = min(stop, float(r.ema21))
+        if bool(r.cross_down if sign == 1 else r.cross_up) or int(r.st_dir) == -sign:
+            ex = (dt, c, 'SIGNAL EXIT (EMA cross / Supertrend flip)', 'model'); break
+        if exp is not None and (exp - dt.date()).days <= 5:
+            ex = (dt, c, 'EXPIRY WINDOW (<=5 days)', 'model'); break
+        if days >= max_hold:
+            ex = (dt, c, f'MAX HOLD {max_hold} DAYS', 'model'); break
+        if days >= 5 and not t1_hit and (c - entry) * sign < 0.5 * risk_pts:
+            ex = (dt, c, 'TIME EXIT (no progress in 5 days)', 'model'); break
+    last_u = float(bars.iloc[-1].Close) if len(bars) else entry
+    res = {'stop_current': round(stop, 2), 't1_hit': t1_hit, 'days_held': days, 'last_underlying': last_u,
+           'last_update': bars.index[-1].strftime('%Y-%m-%d') if len(bars) else '', 'exit': None}
+    if prem0 == prem0:
+        res['model_premium'] = model_premium(prem0, delta, entry, last_u)
+    if ex:
+        dt, px, reason, kind = ex
+        res['exit'] = {'date': dt.strftime('%Y-%m-%d'), 'px': px, 'reason': reason,
+                       'prem': prem0 * (1 - prem_sl_frac) if kind == 'prem_sl' else (model_premium(prem0, delta, entry, px) if prem0 == prem0 else np.nan)}
+    return res
+
+
+def close_row(df, idx, exit_date, exit_u, exit_prem, reason, slip_pct):
+    t = df.loc[idx]
+    sign = 1 if t['side'] == 'CE' else -1
+    entry = float(t['underlying_entry'])
+    pts = (exit_u - entry) * sign
+    risk_pts = abs(entry - float(t['underlying_sl'])) or np.nan
+    df.loc[idx, ['status', 'closed_at', 'exit_reason', 'exit_underlying', 'underlying_points', 'r_underlying']] = \
+        ['CLOSED', exit_date, reason, round(exit_u, 2), round(pts, 2), round(pts / risk_pts, 2) if risk_pts == risk_pts else np.nan]
+    prem0, lots, lot = num(t['entry_premium']), num(t['lots'], 0), num(t['lot_size'], 0)
+    qty = lots * lot
+    if prem0 == prem0 and qty > 0 and exit_prem == exit_prem:
+        eff_exit = exit_prem * (1 - slip_pct / 100)
+        gross = (eff_exit - prem0) * qty
+        costs = option_costs(prem0, eff_exit, qty)
+        df.loc[idx, ['exit_premium', 'gross_pnl', 'costs', 'net_pnl', 'unrealized_pnl']] = \
+            [round(exit_prem, 2), round(gross, 2), costs, round(gross - costs, 2), 0.0]
+    return df
+
+
+def journal_stats(df):
+    c = df[df.status == 'CLOSED'].copy()
+    if c.empty:
+        return None
+    pnl = pd.to_numeric(c.net_pnl, errors='coerce')
+    win = np.where(pnl.notna(), pnl > 0, pd.to_numeric(c.underlying_points, errors='coerce') > 0)
+    gp, gl = pnl[pnl > 0].sum(), -pnl[pnl < 0].sum()
+    eq = pnl.fillna(0).cumsum()
+    return {'Closed trades': len(c), 'Win rate %': round(100 * float(np.mean(win)), 1),
+            'Net P&L Rs (option trades)': round(float(pnl.sum()), 2),
+            'Profit factor': round(gp / gl, 2) if gl > 0 else ('inf' if gp > 0 else 0),
+            'Avg R (underlying)': round(float(pd.to_numeric(c.r_underlying, errors='coerce').mean()), 2),
+            'Expectancy Rs / trade': round(float(pnl.mean()), 2) if pnl.notna().any() else None,
+            'Max drawdown Rs': round(float((eq - eq.cummax()).min()), 2)}, eq
+
+
+def entry_guard(df, sym, side, new_exposure, capital, max_open, max_exposure_pct, weekly_limit_pct):
+    """Spec risk rules. Returns list of blocking messages."""
+    msgs = []
+    openr = df[df.status == 'OPEN']
+    if len(openr) >= max_open: msgs.append(f'Max {max_open} open trades reached')
+    if sym in set(openr.symbol): msgs.append('Already open in this instrument')
+    corr = [s for s in openr.symbol if s in INDEX_GROUP]
+    if sym in INDEX_GROUP and corr: msgs.append(f'Highly correlated with open index trade ({corr[0]})')
+    exposure = float((pd.to_numeric(openr.entry_premium, errors='coerce') * pd.to_numeric(openr.lot_size, errors='coerce') *
+                      pd.to_numeric(openr.lots, errors='coerce')).sum())
+    if exposure + new_exposure > capital * max_exposure_pct / 100:
+        msgs.append(f'Premium exposure would exceed {max_exposure_pct:g}% of capital')
+    closed = df[df.status == 'CLOSED'].copy()
+    if not closed.empty:
+        closed['ts'] = pd.to_datetime(closed.closed_at, errors='coerce')
+        wk_start = pd.Timestamp(datetime.now(IST).date() - timedelta(days=datetime.now(IST).weekday()))
+        wk = pd.to_numeric(closed[closed.ts >= wk_start].net_pnl, errors='coerce').sum()
+        if wk <= -capital * weekly_limit_pct / 100: msgs.append(f'Weekly loss limit {weekly_limit_pct:g}% hit (Rs {wk:,.0f}) - stop trading this week')
+        last3 = closed.sort_values('ts').tail(3)
+        res = pd.to_numeric(last3.net_pnl, errors='coerce').fillna(pd.to_numeric(last3.underlying_points, errors='coerce'))
+        if len(last3) == 3 and (res < 0).all(): msgs.append('3 consecutive losses - pause and review')
+    return msgs
+
+
+def live_premiums(api, df):
+    """One chain request per (symbol, expiry). Returns {trade_id: (ltp, error)}."""
+    out = {}
+    o = df[(df.status == 'OPEN') & df.expiry.notna() & df.chain_seg.notna() & (pd.to_numeric(df.entry_premium, errors='coerce') > 0)]
+    for (sym, exp, sid, seg), g in o.groupby(['symbol', 'expiry', 'chain_sid', 'chain_seg']):
+        try:
+            _, ch = parse_chain(api.chain(str(sid).replace('.0', ''), seg, exp))
+            for _, t in g.iterrows():
+                m = ch[(ch.strike == float(t.strike)) & (ch.type == t.side)]
+                out[t['id']] = (float(m.iloc[0].ltp), '') if len(m) and m.iloc[0].ltp > 0 else (np.nan, 'strike not in chain')
+        except Exception as e:
+            for tid in g['id']:
+                out[tid] = (np.nan, str(e)[:100])
+    return out
+
+
+# =====================================================================================
+# FII / DII (market-wide, NOT from Dhan)
+# =====================================================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_fii_dii_nse():
+    try:
+        hdr = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'application/json',
+               'Referer': 'https://www.nseindia.com/reports/fii-dii'}
+        s = requests.Session()
+        s.get('https://www.nseindia.com/', headers=hdr, timeout=12)
+        r = s.get('https://www.nseindia.com/api/fiidiiTradeReact', headers=hdr, timeout=12)
+        r.raise_for_status()
+        out = {}
+        for it in r.json():
+            cat = str(it.get('category', '')).upper()
+            net = float(str(it.get('netValue', '0')).replace(',', ''))
+            if 'FII' in cat or 'FPI' in cat: out['fii'], out['date'] = net, it.get('date', '')
+            elif 'DII' in cat: out['dii'] = net
+        return out if 'fii' in out and 'dii' in out else {'error': 'unexpected NSE response'}
+    except Exception as e:
+        return {'error': str(e)[:150]}
+
+
+# =====================================================================================
+# 5. UI
+# =====================================================================================
+STATUS_RANK = {'FRESH ENTRY': 0, 'MONTH SETUP': 1, 'WATCHLIST': 2, 'REJECTED': 3}
+HIDE = ['sid', 'segment', 'instrument']
+
+
+def main():
+    st.set_page_config(page_title='Dhan Swing Options V4', page_icon='📊', layout='wide')
+    st.title('Dhan Swing Options V4 | F&O Scanner + Option Picker + Paper Trading')
+    st.caption('Dhan API only · manual execution · no orders are ever sent · research tool, not advice, no guaranteed profit')
+
+    def secret(name):
+        try: return os.getenv(name) or st.secrets.get(name, '')
+        except Exception: return os.getenv(name, '')
+
+    with st.sidebar:
+        st.header('Dhan connection')
+        token = st.text_input('Access token', value=secret('DHAN_ACCESS_TOKEN'), type='password')
+        client_id = st.text_input('Client ID', value=secret('DHAN_CLIENT_ID'))
+        st.caption('Dhan access tokens expire (usually in 24h). If every instrument fails with 401 / DH-901, generate a new token.')
+        st.header('Risk')
+        capital = st.number_input('Capital (Rs)', 10000, 100000000, 100000, 5000)
+        risk_pct = st.slider('Risk per trade (%)', 1.0, 2.0, 1.0, 0.5)
+        max_open = st.number_input('Max open trades', 1, 10, 3)
+        max_exposure = st.slider('Max premium exposure (% capital)', 5, 50, 20)
+        weekly_limit = st.slider('Weekly loss limit (% capital)', 1.0, 10.0, 4.0, 0.5)
+        st.header('Signal rules')
+        min_score = st.slider('Min score - fresh entry', 7, 10, 7)
+        month_min = st.slider('Min score - month setup', 7, 10, 8)
+        cpr_width = st.slider('Max weekly CPR width (%)', 0.1, 5.0, 1.5, 0.1) / 100
+        require_monthly = st.checkbox('Require monthly trend to agree with side', True)
+        max_ext = st.slider('Month setups: max distance from EMA21 (ATR)', 1.0, 5.0, 2.0, 0.5,
+                            help='Stops chasing a stale trigger that already ran far away.')
+        scan_days = st.selectbox('Historical-signal lookback (days)', [1, 5, 10, 20], index=3)
+        events = st.text_area('Event / results blackout dates (YYYY-MM-DD, one per line, applies to all)', '')
+        st.header('FII / DII (market-wide context)')
+        use_flow = st.checkbox('Auto-fetch from NSE (best effort)', True)
+        flow_gate = st.checkbox('Block CE when FII+DII both selling (PE: both buying)', False)
+        fii_m = st.number_input('FII net Rs cr - manual override (0 = none)', value=0.0, step=100.0)
+        dii_m = st.number_input('DII net Rs cr - manual override (0 = none)', value=0.0, step=100.0)
+        st.header('Option rules')
+        min_days = st.number_input('Min days to monthly expiry', 5, 45, 15)
+        d_lo, d_hi = st.slider('|Delta| range', 0.30, 0.90, (0.50, 0.65), 0.01)
+        max_spread = st.slider('Max bid-ask spread (%)', 1.0, 15.0, 5.0, 0.5)
+        sl_frac = st.slider('Premium stop-loss (%)', 10, 50, 30) / 100
+        slip = st.slider('Exit slippage (%)', 0.0, 3.0, 0.5, 0.1)
+
+    opt_params = {'capital': capital, 'risk_pct': risk_pct, 'min_days': int(min_days), 'delta_lo': d_lo, 'delta_hi': d_hi,
+                  'max_spread': max_spread, 'sl_frac': sl_frac, 'max_exposure': max_exposure}
+    blackouts = [x.strip() for x in events.splitlines() if x.strip()]
+
+    # ---- FII/DII resolution
+    fii = dii = None
+    flow_src = 'unknown'
+    if fii_m or dii_m:
+        fii, dii, flow_src = fii_m, dii_m, 'manual'
+    elif use_flow:
+        f = fetch_fii_dii_nse()
+        if 'error' not in f:
+            fii, dii, flow_src = f['fii'], f['dii'], f"NSE {f.get('date', '')}"
+        else:
+            flow_src = 'NSE fetch failed: ' + f['error']
+    with st.sidebar:
+        st.caption(f'Flow source: {flow_src}' + (f' | FII {fii:,.0f} cr, DII {dii:,.0f} cr' if fii is not None else ''))
+
+    cfg = {'min_score': min_score, 'month_min_score': month_min, 'max_weekly_cpr_width': cpr_width,
+           'require_monthly': require_monthly, 'max_ext_atr': max_ext, 'flow_gate': flow_gate,
+           'scan_days': scan_days, 'event_blackout_dates': {}}
+
+    # ---- session state
+    ss = st.session_state
+    store = get_scan_store()
+    skey = hashlib.sha256((token or 'none').encode()).hexdigest()[:12]
+    if 'scan' not in ss:
+        saved = store.get(skey, {})
+        ss.scan, ss.history = saved.get('scan', pd.DataFrame()), saved.get('history', pd.DataFrame())
+    ss.setdefault('options', {})
+    ss.setdefault('scan_errors', pd.DataFrame())
+    ss.setdefault('seg_memory', {})
+    ss.setdefault('actions', [])
+    journal = JournalStore(secret('GITHUB_TOKEN'), secret('PAPER_GIST_ID'))
+    if 'paper' not in ss:
+        ss.paper, ss.paper_msg = journal.load()
+        ss.gist_id = journal.gist_id
+    journal.gist_id = ss.get('gist_id', journal.gist_id)
+
+    def persist():
+        ss.paper_msg = journal.save(ss.paper)
+        ss.gist_id = journal.gist_id
+
+    cache = get_cache()
+    t1, t2, t3, t4 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading'])
+
+    # ============================ TAB 1 ============================
+    with t1:
+        try:
+            with st.spinner('Loading F&O universe from Dhan instrument master (cached 24h)…'):
+                stocks, indices = load_universe()
+        except Exception as e:
+            stocks, indices = pd.DataFrame(), pd.DataFrame()
+            st.error(f'Universe load failed: {e}')
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric('F&O stocks found', len(stocks)); c2.metric('Indices', len(indices))
+        c3.metric('Last complete session', last_complete_session().isoformat())
+        if c4.button('Refresh instrument master'):
+            load_universe.clear(); st.rerun()
+        with st.expander('Universe preview'):
+            show(pd.concat([indices, stocks]).head(60))
+        cc1, cc2, cc3 = st.columns([2, 2, 3])
+        scan_all = cc1.checkbox('Scan ALL F&O stocks', True)
+        n_limit = cc2.number_input('…or first N stocks', 1, 400, 30, disabled=scan_all)
+        only = cc3.text_input('Only these symbols (optional, comma separated)', '')
+        inc_idx = st.checkbox('Include indices (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50)', True)
+        workers = 4
+        if st.button('SCAN NOW', type='primary', disabled=not (token and len(stocks))):
+            api = DhanAPI(token, client_id)
+            cutoff = last_complete_session()
+            pool = stocks if (scan_all or only) else stocks.head(int(n_limit))
+            targets = pool.to_dict('records')
+            if only:
+                want = {s.strip().upper() for s in only.split(',') if s.strip()}
+                targets = [x for x in targets if x['symbol'] in want]
+                if inc_idx: targets = [x for x in indices.to_dict('records') if x['symbol'] in want] + targets
+            elif inc_idx:
+                targets = indices.to_dict('records') + targets
+            results, hist, errors = [], [], []
+            prog = st.progress(0.0, text='Starting…')
+            t0, done, auth_fail = time.monotonic(), 0, 0
+
+            def job(x):
+                s = time.monotonic()
+                return load_daily(api, cache, x, cutoff), time.monotonic() - s
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(job, x): x for x in targets}
+                for f in as_completed(futs):
+                    x = futs[f]
+                    try:
+                        daily, secs = f.result()
+                        c = dict(cfg); c['event_blackout_dates'] = {x['symbol']: blackouts}
+                        row, h = analyze_instrument(x, daily, c, fii, dii, secs)
+                        results.append(row); hist += h
+                    except Exception as e:
+                        msg = str(e)
+                        errors.append({'Symbol': x['symbol'], 'Error': msg})
+                        if '401' in msg or 'DH-901' in msg or 'DH-902' in msg or 'Invalid_Authentication' in msg:
+                            auth_fail += 1
+                    done += 1
+                    prog.progress(done / len(targets), text=f'{done}/{len(targets)} · {x["symbol"]}')
+                    if auth_fail >= 5 and not results:
+                        for ff in futs: ff.cancel()
+                        break
+            prog.empty()
+            if auth_fail >= 5 and not results:
+                st.error('Dhan rejected the token (401/DH-901). Generate a fresh access token and update Streamlit Secrets / the sidebar.')
+            if results:
+                df = pd.DataFrame(results)
+                prior = ss.scan
+                if not prior.empty and (only or not scan_all):
+                    df = pd.concat([prior[~prior.Symbol.isin(df.Symbol)], df], ignore_index=True)
+                df['_r'] = df.Status.map(STATUS_RANK)
+                df = df.sort_values(['_r', 'Score', 'ADX'], ascending=[True, False, False]).drop(columns='_r').reset_index(drop=True)
+                ss.scan = df
+                ss.history = pd.DataFrame(hist).drop_duplicates(['Symbol', 'Date', 'Side']) if hist else pd.DataFrame()
+                ss.options = {}
+                store[skey] = {'scan': ss.scan, 'history': ss.history}
+                st.success(f'Scanned {len(results)} instruments in {time.monotonic() - t0:.0f}s ({len(errors)} failed).')
+            ss.scan_errors = pd.DataFrame(errors)
+        if not ss.scan_errors.empty:
+            with st.expander(f'{len(ss.scan_errors)} instruments failed'):
+                show(ss.scan_errors)
+                st.download_button('Download API errors CSV', ss.scan_errors.to_csv(index=False), 'dhan_api_errors.csv')
+        if not ss.scan.empty:
+            s = ss.scan
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric('Scanned', len(s)); m2.metric('Fresh entries', int((s.Status == 'FRESH ENTRY').sum()))
+            m3.metric('Month setups', int((s.Status == 'MONTH SETUP').sum()))
+            m4.metric('Watchlist', int((s.Status == 'WATCHLIST').sum()))
+            m5.metric('Bullish / Bearish month', f"{int((s['Monthly trend'] == 'BULLISH').sum())} / {int((s['Monthly trend'] == 'BEARISH').sum())}")
+            show(s.drop(columns=HIDE))
+            st.download_button('Download scanner CSV', s.drop(columns=HIDE).to_csv(index=False).encode(), 'dhan_scan.csv')
+        else:
+            st.info('Press SCAN NOW. All F&O stocks + indices are scanned in parallel (about 1-2 minutes first time; repeat scans use the 6h cache).')
+
+    # ============================ TAB 2 ============================
+    with t2:
+        s = ss.scan
+        if s.empty:
+            st.info('Run a scan first.')
+        else:
+            elig = s[s.Eligible].sort_values(['Status', 'Score', 'ADX'], ascending=[True, False, False])
+            st.markdown('**FRESH ENTRY** = full strict signal on the last completed candle. '
+                        '**MONTH SETUP** = score ≥ month minimum, EMA-cross / CPR-breakout happened this month, all hard gates pass, price not extended. '
+                        'Both are eligible for CE/PE option selection. Flow context is market-wide, not stock-specific.')
+            st.metric('Eligible setups', len(elig))
+            if elig.empty:
+                st.warning('No eligible setup in this scan. Do not force a trade.')
+            else:
+                show(elig.drop(columns=HIDE))
+                top_n = st.slider('Fetch option contracts for the top N eligible setups', 1, 15, min(5, len(elig)))
+                if st.button('Select monthly CE/PE contracts (Dhan option chain)', type='primary', disabled=not (token and client_id)):
+                    api = DhanAPI(token, client_id)
+                    prog = st.progress(0.0, text='Option chains…')
+                    rows = elig.head(top_n).to_dict('records')
+                    for i, row in enumerate(rows):
+                        ss.options[row['Symbol']] = option_for_setup(api, row, opt_params, ss.seg_memory)
+                        prog.progress((i + 1) / len(rows), text=f"{i + 1}/{len(rows)} · {row['Symbol']} (chain limit: 1 request / 3 s)")
+                    prog.empty()
+                if not client_id: st.warning('DHAN_CLIENT_ID is required for option-chain calls.')
+            if ss.options:
+                st.subheader('Proposed option contracts')
+                cols = ['Symbol', 'Side', 'Verdict', 'Contract', 'Expiry', 'Days left', 'Where', 'Entry premium (ask)', 'LTP', 'Spread %',
+                        'Delta', 'IV %', 'OI', 'Volume', 'Lot size', 'Lots', 'Outlay Rs', 'Max loss Rs (SL)', 'Premium SL',
+                        'Premium T1 (1R)', 'Premium T2 (2R)', 'Note']
+                od = pd.DataFrame([{k: v for k, v in o.items() if not k.startswith('_')} for o in ss.options.values()])
+                show(od[[c for c in cols if c in od.columns]])
+                st.caption('Premium levels use the premium stop-loss % from the sidebar (T1 = +1R, T2 = +2R). Lots = risk budget / (premium × SL% × lot size), capped by the exposure limit. IV percentile is not provided by Dhan.')
+            for lbl, status in (('Watchlist (score ≥ month minimum but a hard gate blocks)', 'WATCHLIST'),):
+                w = s[s.Status == status]
+                with st.expander(f'{lbl}: {len(w)}'):
+                    show(w.drop(columns=HIDE))
+            with st.expander(f'Rejected: {int((s.Status == "REJECTED").sum())}'):
+                show(s[s.Status == 'REJECTED'].drop(columns=HIDE))
+            if not ss.history.empty:
+                with st.expander('Historical daily signals in lookback window (NOT fresh entries)'):
+                    show(ss.history.sort_values('Date', ascending=False))
+
+    # ============================ TAB 3 ============================
+    with t3:
+        s = ss.scan
+        if s.empty:
+            st.info('Run a scan first.')
+        else:
+            sym = st.selectbox('Instrument', s.Symbol.tolist(), key='an_sym')
+            row = s[s.Symbol == sym].iloc[0]
+            show(pd.DataFrame([row.drop(labels=HIDE)]))
+            if row['Hard blocks']: st.warning('Hard blocks: ' + row['Hard blocks'])
+            if token:
+                try:
+                    x = {'symbol': sym, 'sid': row.sid, 'segment': row.segment, 'instrument': row.instrument}
+                    if row.instrument == 'INDEX':
+                        _, idf = load_universe()
+                        x['fut_sid'] = str(idf.set_index('symbol').loc[sym, 'fut_sid'])
+                    daily = load_daily(DhanAPI(token, client_id), cache, x, last_complete_session())
+                    d = indicators(daily).tail(120)
+                    st.line_chart(d[['Close', 'ema21', 'ema50', 'ema200']])
+                    show(d.tail(10)[['Open', 'High', 'Low', 'Close', 'Volume', 'ema9', 'ema21', 'adx', 'rsi', 'st_dir', 'cpr_width']].round(2).reset_index(), hide_index=True)
+                except Exception as e:
+                    st.error(f'Chart unavailable: {e}')
+            st.warning('Underlying SL/targets are reference levels, not option prices. Use tab 2 for the option contract.')
+            if st.button('Inspect option contracts for this instrument', disabled=not (token and client_id)):
+                ss.options[sym] = option_for_setup(DhanAPI(token, client_id), row.to_dict(), opt_params, ss.seg_memory)
+            o = ss.options.get(sym)
+            if o:
+                st.write(f"**{o.get('Contract', sym)}** · verdict **{o['Verdict']}** · {o.get('Note', '')}")
+                if isinstance(o.get('_cand'), pd.DataFrame) and not o['_cand'].empty:
+                    show(o['_cand'].round(2))
+
+    # ============================ TAB 4 ============================
+    with t4:
+        st.subheader('Paper trading journal (option premium based)')
+        mode = journal.mode
+        st.caption(f"Storage: {'GitHub Gist (permanent)' if mode == 'gist' else 'local file (lost when Streamlit Cloud reboots - add GITHUB_TOKEN)'} · {ss.get('paper_msg', '')}")
+        if mode == 'gist' and ss.get('gist_id') and not secret('PAPER_GIST_ID'):
+            st.warning(f"Add this to Streamlit Secrets so the journal reloads after a reboot:  PAPER_GIST_ID = \"{ss.gist_id}\"")
+        jr = ss.paper
+        openr = jr[jr.status == 'OPEN']
+        expo = float((pd.to_numeric(openr.entry_premium, errors='coerce') * pd.to_numeric(openr.lot_size, errors='coerce') * pd.to_numeric(openr.lots, errors='coerce')).sum())
+        k1, k2, k3 = st.columns(3)
+        k1.metric('Open trades', f'{len(openr)} / {max_open}')
+        k2.metric('Premium exposure', f'Rs {expo:,.0f}', f'cap Rs {capital * max_exposure / 100:,.0f}', delta_color='off')
+        k3.metric('Unrealized P&L (Rs)', f"{pd.to_numeric(openr.unrealized_pnl, errors='coerce').sum():,.0f}")
+
+        # ---- update open trades
+        if st.button('Update open trades (apply SL / targets / trail / time / signal exits)', type='primary',
+                     disabled=openr.empty or not token):
+            api = DhanAPI(token, client_id)
+            cutoff = last_complete_session()
+            live = live_premiums(api, ss.paper) if (client_id and st.session_state.get('use_live', True)) else {}
+            msgs = []
+            for idx in ss.paper.index[ss.paper.status == 'OPEN']:
+                t = ss.paper.loc[idx]
+                try:
+                    x = {'symbol': t.symbol, 'sid': str(t.sid).replace('.0', ''), 'segment': t.segment, 'instrument': t.instrument}
+                    if t.instrument == 'INDEX':
+                        _, idf = load_universe()
+                        x['fut_sid'] = str(idf.set_index('symbol').loc[t.symbol, 'fut_sid'])
+                    d = indicators(load_daily(api, cache, x, cutoff, force=True))
+                    r = evaluate_trade(t, d, num(t.sl_frac, sl_frac))
+                    ltp = live.get(t['id'], (np.nan, ''))[0]
+                    ss.paper.loc[idx, ['stop_current', 't1_hit', 'days_held', 'last_update', 'last_underlying']] = \
+                        [r['stop_current'], r['t1_hit'], r['days_held'], r['last_update'], round(r['last_underlying'], 2)]
+                    prem0, qty = num(t.entry_premium), num(t.lots, 0) * num(t.lot_size, 0)
+                    cur = ltp if ltp == ltp else r.get('model_premium', np.nan)
+                    if prem0 == prem0:
+                        ss.paper.loc[idx, ['last_premium', 'premium_source', 'unrealized_pnl']] = \
+                            [round(cur, 2), 'chain LTP' if ltp == ltp else 'model (delta estimate)', round((cur - prem0) * qty, 2)]
+                    if r['exit']:
+                        e = r['exit']
+                        close_row(ss.paper, idx, e['date'], e['px'], e['prem'], e['reason'], slip)
+                        msgs.append(f"{t.symbol}: CLOSED - {e['reason']}")
+                except Exception as e:
+                    msgs.append(f'{t.symbol}: update failed - {str(e)[:120]}')
+            persist()
+            for m in msgs: st.info(m)
+            st.success('Open trades updated.')
+        st.checkbox('Also fetch live option premium (chain LTP) when updating', True, key='use_live')
+
+        # ---- new entry
+        st.markdown('#### New paper entry')
+        s = ss.scan
+        eligible = s[s.Eligible] if not s.empty else s
+        if eligible.empty:
+            st.info('No eligible setup in the latest scan.')
+        else:
+            sym = st.selectbox('Eligible setup', eligible.Symbol.tolist(), key='pe_sym')
+            row = eligible[eligible.Symbol == sym].iloc[0]
+            o = ss.options.get(sym) or {}
+            st.write(f"{row.Status} · {row.Side} · score {row.Score} · underlying entry {row.Close} · SL {row['Underlying SL']} · T1 {row['Target 1 (1R)']} · T2 {row['Target 2 (2R)']}")
+            if o.get('Contract'): st.write(f"Option: **{o['Contract']}** (verdict {o['Verdict']})")
+            else: st.caption('No option contract fetched for this setup - select it in tab 2, or type premium/lot manually (0 = underlying-only paper trade).')
+            e1, e2, e3, e4 = st.columns(4)
+            prem = e1.number_input('Entry premium', 0.0, 100000.0, float(o.get('Entry premium (ask)') or 0.0), 0.05, key=f'pp_{sym}')
+            lot = e2.number_input('Lot size', 0, 100000, int(o.get('Lot size') or num(row.get('Lot size'), 0)), key=f'pl_{sym}')
+            auto_lots = size_position(capital, risk_pct, prem, lot, sl_frac, max_exposure)[0] if prem > 0 and lot > 0 else 0
+            lots = e3.number_input('Lots', 0, 1000, int(auto_lots), key=f'pn_{sym}_{auto_lots}')
+            strike = e4.number_input('Strike', 0.0, 1000000.0, float(o.get('Strike') or 0.0), key=f'ps_{sym}')
+            exp_txt = st.text_input('Expiry (YYYY-MM-DD)', o.get('Expiry', ''), key=f'pe_{sym}')
             if st.button('Record paper entry'):
-                if len(st.session_state.paper[st.session_state.paper.status=='OPEN']) >= 3:
-                    st.error('Maximum 3 open paper trades.')
-                elif sym in set(st.session_state.paper.loc[st.session_state.paper.status=='OPEN','symbol']):
-                    st.error('Already have an open paper trade for this instrument.')
+                new_exp = prem * lot * lots
+                bad = entry_guard(ss.paper, sym, row.Side, new_exp, capital, int(max_open), max_exposure, weekly_limit)
+                if prem > 0 and (lot <= 0 or lots <= 0): bad.append('Option trade needs lot size and lots >= 1 (or set premium 0 for underlying-only)')
+                if bad:
+                    for b in bad: st.error(b)
                 else:
-                    record={'id':pd.Timestamp.now().strftime('%Y%m%d%H%M%S%f'),'opened_at':pd.Timestamp.now().isoformat(),
-                            'symbol':sym,'side':r.Side,'reference_entry':r.Close,'reference_stop':r['Underlying SL'],
-                            'reference_target1':r['Target 1 (1R)'],'reference_target2':r['Target 2 (2R)'],
-                            'score':r.Score,'status':'OPEN','closed_at':'','reference_exit':None,'underlying_points':None,'notes':'Paper reference only; not option P&L'}
-                    st.session_state.paper=pd.concat([st.session_state.paper,pd.DataFrame([record])],ignore_index=True)
-                    st.success('Paper entry recorded')
-    journal=st.session_state.paper
-    if not journal.empty:
-        st.dataframe(journal,use_container_width=True,hide_index=True)
-        opened=journal[journal.status=='OPEN']
-        if not opened.empty:
-            trade_id=st.selectbox('Open trade ID',opened.id.astype(str).tolist())
-            exit_price=st.number_input('Underlying exit reference price',min_value=.01,value=1.0,step=1.0)
-            if st.button('Close paper trade'):
-                idx=st.session_state.paper.index[st.session_state.paper.id.astype(str)==trade_id][0]
-                side=st.session_state.paper.loc[idx,'side']; entry=float(st.session_state.paper.loc[idx,'reference_entry'])
-                points=(exit_price-entry)*(1 if side=='CE' else -1)
-                st.session_state.paper.loc[idx,['status','closed_at','reference_exit','underlying_points']]=['CLOSED',pd.Timestamp.now().isoformat(),exit_price,points]
-                st.success('Paper trade closed')
-        st.download_button('Export paper journal CSV',st.session_state.paper.to_csv(index=False).encode(),file_name='paper_trades.csv',mime='text/csv')
-    else: st.info('No paper trades yet. Scan first and record a qualifying setup.')
+                    opt = prem > 0
+                    rec = {c: np.nan for c in JOURNAL_COLS}
+                    rec.update({'id': datetime.now(IST).strftime('%Y%m%d%H%M%S%f'), 'opened_at': datetime.now(IST).isoformat(timespec='seconds'),
+                                'signal_date': row.Date, 'symbol': sym, 'side': row.Side, 'status': 'OPEN', 'setup': row.Status, 'score': row.Score,
+                                'underlying_entry': row.Close, 'underlying_sl': row['Underlying SL'], 'underlying_t1': row['Target 1 (1R)'],
+                                'underlying_t2': row['Target 2 (2R)'], 'sid': row.sid, 'segment': row.segment, 'instrument': row.instrument,
+                                'stop_current': row['Underlying SL'], 't1_hit': False, 'days_held': 0, 'sl_frac': sl_frac,
+                                'notes': 'Option premium paper trade' if opt else 'Underlying-only paper trade'})
+                    if opt:
+                        d_val = num(o.get('Delta'), 0.55 * (1 if row.Side == 'CE' else -1))
+                        rec.update({'contract': o.get('Contract', f'{sym} {exp_txt} {strike:g} {row.Side}'), 'expiry': exp_txt or np.nan,
+                                    'strike': strike or np.nan, 'lot_size': lot, 'lots': lots, 'entry_premium': prem, 'entry_delta': d_val,
+                                    'entry_iv': o.get('IV %', np.nan), 'chain_sid': o.get('chain_sid', row.sid), 'chain_seg': o.get('chain_seg', ''),
+                                    'last_premium': prem, 'premium_source': 'entry', 'unrealized_pnl': 0.0})
+                    ss.paper = pd.concat([ss.paper, pd.DataFrame([rec])], ignore_index=True)
+                    persist()
+                    st.success('Paper entry recorded.')
+
+        # ---- tables
+        jr = ss.paper
+        st.markdown('#### Open trades')
+        show(jr[jr.status == 'OPEN'].drop(columns=['sid', 'segment', 'instrument', 'chain_sid', 'chain_seg', 'sl_frac'], errors='ignore'))
+        res = journal_stats(jr)
+        st.markdown('#### Closed trades & statistics')
+        if res:
+            stats, eq = res
+            show(pd.DataFrame([stats]))
+            st.line_chart(eq.reset_index(drop=True), height=200)
+        show(jr[jr.status == 'CLOSED'].drop(columns=['sid', 'segment', 'instrument', 'chain_sid', 'chain_seg', 'sl_frac'], errors='ignore'))
+        st.caption('Premium P&L for model exits is a first-order delta estimate (no theta/IV change) with approximate Zerodha costs and the slippage % from the sidebar. Treat it as optimistic.')
+
+        # ---- manual close / delete
+        if not jr.empty:
+            with st.expander('Manual close / delete'):
+                tid = st.selectbox('Trade', jr.id.astype(str).tolist(), key='mc_id')
+                m1, m2 = st.columns(2)
+                xu = m1.number_input('Exit underlying price', 0.0, 10000000.0, 0.0, key='mc_u')
+                xp = m2.number_input('Exit premium (0 = unknown)', 0.0, 100000.0, 0.0, 0.05, key='mc_p')
+                b1, b2 = st.columns(2)
+                if b1.button('Close this trade manually'):
+                    idx = ss.paper.index[ss.paper.id.astype(str) == tid][0]
+                    if ss.paper.loc[idx, 'status'] == 'OPEN' and xu > 0:
+                        close_row(ss.paper, idx, datetime.now(IST).date().isoformat(), xu, xp if xp > 0 else np.nan, 'MANUAL EXIT', slip)
+                        persist(); st.success('Closed.')
+                    else: st.error('Trade already closed, or exit price missing.')
+                if b2.button('Delete this trade'):
+                    ss.paper = ss.paper[ss.paper.id.astype(str) != tid].reset_index(drop=True)
+                    persist(); st.success('Deleted.')
+        up = st.file_uploader('Restore journal CSV', type='csv', key='paper_up')
+        if up and st.button('Import journal CSV'):
+            try:
+                ss.paper = normalize_journal(pd.read_csv(up)); persist(); st.success('Imported.')
+            except Exception as e: st.error(str(e))
+        st.download_button('Export journal CSV', normalize_journal(ss.paper).to_csv(index=False).encode(), 'paper_trades.csv')
+
+
+main()
