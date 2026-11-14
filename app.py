@@ -7,8 +7,8 @@ from dhan_api import DhanAPI, read_instrument_master, build_universe
 from signals import indicators, annotate, score, rejection_reasons
 
 st.set_page_config(page_title='Dhan Swing Options V3', page_icon='📊', layout='wide')
-st.title('Dhan Swing Options V3.4 | F&O Scanner + Paper Trading')
-st.caption('Dhan API only · Manual execution · No Telegram · No Yahoo · No automatic orders')
+st.title('Dhan Swing Options V3.5 | Monthly Trend + F&O Scanner')
+st.caption('Dhan API only · Manual execution · No Telegram · No Yahoo · No automatic orders · FII/DII optional manual context')
 
 try:
     secret_token = st.secrets.get('DHAN_ACCESS_TOKEN', '')
@@ -32,6 +32,12 @@ with st.sidebar:
     index_vol = st.checkbox('Include indices in scanner', value=True)
     st.caption('Index spot volume may be zero. Such index signals remain unconfirmed and cannot become eligible trades.')
     events = st.text_area('Event blackout dates (YYYY-MM-DD, one per line)', '')
+    st.header('Institutional context (optional)')
+    st.caption('FII/DII cash-market totals are market-wide, not stock-specific. Dhan candle API does not supply verified FII/DII flows. Leave blank unless sourced and dated.')
+    fii = st.number_input('FII net cash flow ₹ crore (manual; 0 = unknown)', value=0.0, step=100.0)
+    dii = st.number_input('DII net cash flow ₹ crore (manual; 0 = unknown)', value=0.0, step=100.0)
+    flow_date = st.date_input('Institutional flow as-of date', value=date.today())
+    st.caption('FII/DII is informational only and never overrides technical or option liquidity gates.')
 
 if 'scan' not in st.session_state: st.session_state.scan = pd.DataFrame()
 if 'history' not in st.session_state: st.session_state.history = pd.DataFrame()
@@ -114,13 +120,33 @@ with t1:
                     entry = float(r.Close)
                     risk = float(r.atr) * 1.5
                     reasons = rejection_reasons(r, side, cfg, x['symbol'], volok)
+                    month_rows = d[d.index.to_period('M') == d.index[-1].to_period('M')]
+                    month_open = float(month_rows.iloc[0].Open) if len(month_rows) else float(r.Close)
+                    mtd = (float(r.Close) / month_open - 1) * 100 if month_open > 0 else float('nan')
+                    crosses_up = month_rows.index[month_rows.cross_up.fillna(False)]
+                    crosses_down = month_rows.index[month_rows.cross_down.fillna(False)]
+                    breakouts_up = month_rows.index[month_rows.break_up.fillna(False)]
+                    breakouts_down = month_rows.index[month_rows.break_down.fillna(False)]
+                    monthly_events = (crosses_up.union(breakouts_up) if side == 'CE' else crosses_down.union(breakouts_down))
+                    last_trigger = monthly_events[-1].strftime('%Y-%m-%d') if len(monthly_events) else ''
+                    directional = bool((r.Close > r.ema200 and r.st_dir == 1 and r.rsi > 55 and r.pdi > r.mdi) if side == 'CE' else (r.Close < r.ema200 and r.st_dir == -1 and r.rsi < 45 and r.mdi > r.pdi))
+                    monthly_trend = 'BULLISH' if (r.Close > r.ema50 and mtd > 0 and r.st_dir == 1) else ('BEARISH' if (r.Close < r.ema50 and mtd < 0 and r.st_dir == -1) else 'SIDEWAYS/MIXED')
+                    consistent = (monthly_trend == ('BULLISH' if side == 'CE' else 'BEARISH'))
+                    hard_blocks = []
+                    if not volok or not bool(r.Volume > r.vol20): hard_blocks.append('Volume unconfirmed')
+                    if pd.isna(r.cpr_width) or r.cpr_width > cpr_width: hard_blocks.append('CPR too wide')
+                    if pd.isna(r.adx) or r.adx <= 22: hard_blocks.append('ADX too low')
+                    if not directional: hard_blocks.append('Trend / RSI / DI disagreement')
+                    if not consistent: hard_blocks.append('Monthly trend disagreement')
+                    if any(abs((d.index[-1].date()-pd.Timestamp(e).date()).days)<=3 for e in blackouts): hard_blocks.append('Event blackout')
+                    status = 'FRESH ENTRY' if eligible and not hard_blocks else ('MONTHLY TRIGGER WATCH' if best >= 8 and last_trigger and not hard_blocks else ('STRONG WATCHLIST' if best >= 8 and directional else 'REJECTED'))
                     row = {'Symbol':x['symbol'],'Date':d.index[-1].strftime('%Y-%m-%d'),
-                           'Side':side,'Score':int(best),'Eligible':eligible,'Close':entry,
+                           'Side':side,'Score':int(best),'Eligible':bool(status == 'FRESH ENTRY'),'Status':status,'Monthly trend':monthly_trend,'MTD %':round(mtd,2),'Last monthly trigger':last_trigger,'Monthly trigger':bool(last_trigger),'Hard blocks':'; '.join(hard_blocks),'FII net ₹Cr (market)':fii if fii else None,'DII net ₹Cr (market)':dii if dii else None,'Flow date':str(flow_date) if fii or dii else '', 'Close':entry,
                            'Underlying SL':entry-direction*risk,'Target 1 (1R)':entry+direction*risk,
                            'Target 2 (2R)':entry+direction*2*risk,
                            'ADX':float(r.adx),'RSI':float(r.rsi),'Volume OK':volok,
                            'Weekly CPR width %':float(r.cpr_width)*100 if pd.notna(r.cpr_width) else None,
-                           'Reason': 'Eligible daily signal' if eligible else '; '.join(reasons),
+                           'Reason': 'Eligible daily signal' if status == 'FRESH ENTRY' else '; '.join(reasons),
                            'Failed gates':len(reasons), 'Load seconds':round(time.monotonic()-stock_started,2)}
                     results.append(row)
                     for dt, s in d.tail(scan_days).iterrows():
@@ -133,7 +159,8 @@ with t1:
                 new = pd.DataFrame(results)
                 prior = st.session_state.scan
                 st.session_state.scan = pd.concat([prior[~prior.Symbol.isin(new.Symbol)],new],ignore_index=True) if not prior.empty else new
-                st.session_state.scan = st.session_state.scan.sort_values(['Eligible','Score','ADX'],ascending=[False,False,False]).reset_index(drop=True)
+                st.session_state.scan['Rank'] = st.session_state.scan.Status.map({'FRESH ENTRY':0,'MONTHLY TRIGGER WATCH':1,'STRONG WATCHLIST':2,'REJECTED':3}).fillna(4)
+                st.session_state.scan = st.session_state.scan.sort_values(['Rank','Score','ADX'],ascending=[True,False,False]).drop(columns=['Rank']).reset_index(drop=True)
                 st.session_state.history = pd.concat([st.session_state.history,pd.DataFrame(history)],ignore_index=True).drop_duplicates(['Symbol','Date','Side']) if history else st.session_state.history
                 st.success(f'Scanned {len(results)} instruments in {time.monotonic()-started:.1f}s; {int(new.Eligible.sum())} eligible. Previous batches retained in this session.')
             st.session_state.scan_errors = pd.DataFrame(errors)
@@ -153,8 +180,13 @@ with t2:
         st.metric('Eligible current daily setups',len(current))
         if current.empty: st.warning('No eligible trades in scanned batch. Do not force a trade.')
         else: st.dataframe(current,use_container_width=True,hide_index=True)
-        with st.expander('Rejected / watchlist candidates'):
-            st.dataframe(d[~d.Eligible],use_container_width=True,hide_index=True)
+        st.subheader('Monthly-trigger candidates (score ≥ 8)')
+        st.dataframe(d[d.Status == 'MONTHLY TRIGGER WATCH'],use_container_width=True,hide_index=True)
+        st.subheader('Strong watchlist (score ≥ 8)')
+        st.dataframe(d[d.Status == 'STRONG WATCHLIST'],use_container_width=True,hide_index=True)
+        with st.expander('Rejected candidates and failed conditions'):
+            st.dataframe(d[d.Status == 'REJECTED'],use_container_width=True,hide_index=True)
+        st.info('Monthly-trigger watchlist means a crossover/breakout occurred this month, NOT that entry is safe now. Fresh entry additionally needs current confirmation. Option-chain expiry, IV, spread and OI must be checked manually before paper option entry.')
         st.caption('Historical signals from selected lookback are not fresh entries; see below.')
         if not st.session_state.history.empty: st.dataframe(st.session_state.history.sort_values('Date',ascending=False),use_container_width=True,hide_index=True)
 

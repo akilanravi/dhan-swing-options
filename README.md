@@ -1,36 +1,18 @@
-# Dhan Swing Options V3
+# Dhan Swing Options V3.5
 
-Streamlit research dashboard with Dhan-only F&O universe scanning, score-ranked CE/PE signals and a session-based paper journal.
+Deploy to Streamlit Cloud with `app.py` and `requirements.txt` at repository root. Configure `DHAN_ACCESS_TOKEN` and `DHAN_CLIENT_ID` in Streamlit Secrets.
 
-## Deploy
-Upload `app.py`, `dhan_api.py`, `signals.py`, `requirements.txt` to the root of your existing GitHub repository (replace old files). Streamlit Cloud entrypoint: `app.py`. Add both `DHAN_ACCESS_TOKEN = "..."` and `DHAN_CLIENT_ID = "..."` in Streamlit Cloud Secrets (never commit secrets).
+## Changes
+- Month-to-date return and monthly bullish/bearish/mixed classification from completed daily candles.
+- Detect EMA 9/21 cross or weekly CPR/Camarilla breakout occurring during the current calendar month.
+- Fresh entries, monthly-trigger watchlist, strong watchlist, and rejected candidates sorted by category and score.
+- Score >=8 for watchlist candidates; NOT an automatic option-buy approval.
+- Optional manual FII/DII cash flow with as-of date. Dhan historical candles do not provide these figures.
+- Preserves 4 tabs, cached historical data, and session-based paper journal.
 
-## Usage
-1. Load the Dhan detailed instrument master. If the download fails, upload a current CSV from Dhan.
-2. Check the matched F&O stock universe. Run a small batch of 10–30 first, then use the Start at stock number offset for subsequent batches.
-3. Top CE/PE tab shows valid current daily signals, sorted by score and ADX. Scan history shows older triggers separately.
-4. Use Paper Trading to record simulated underlying reference entries and exits; export CSV frequently and re-import after restarts.
-
-## Critical limitations
-- No verified live API test has been performed; Dhan's instrument-master schema may require adaptation.
-- Index spot volume can be absent: index signals remain ineligible under the strict volume rule.
-- Data fetch is on demand and bounded by Dhan rate limits. It does not continuously scan every F&O stock.
-- Events require manual blackout dates. No automatic earnings calendar.
-- No option strike/premium, lot-size, expiry selection, IV percentile, Greeks, bid-ask, or historical option premium P&L is simulated or invented.
-- The paper journal uses underlying price points only, not actual option returns. Session state is ephemeral on Streamlit Cloud.
-- Index IDs 13 and 25 are starting mappings and must be verified against Dhan master.
-- No automated orders or brokerage charges; not a production-ready live execution system.
-
-## V3.2 fixes
-- Adds Dhan client-id header for option-chain requests and a missing-client-ID diagnostic.
-- Excludes TEST/DUMMY/MOCK entries from discovered F&O stock underlyings.
-- Option-chain calls still require a valid token, correct client ID and Dhan permissions.
-
-
-## V3.3 performance update
-- Dhan instrument master cached for 24 hours using Streamlit cache_data.
-- Daily historical candles cached for 6 hours, per account/instrument/day.
-- Daily warm-up fetch reduced to 400 calendar days (~5 Dhan 85-day chunks per uncached stock).
-- Subsequent batch scans reuse cached history. First full-universe scan still requires many API requests and can be slow; rate limits apply.
-- To refresh stale data, wait for cache TTL or clear Streamlit cache. Do not place access tokens in GitHub.
-- Cache is ephemeral on Streamlit Community Cloud; app restarts can clear it.
+## Limitations
+- The monthly trend is descriptive, not a forecast.
+- The index volume issue remains; index spot volume cannot confirm entry.
+- Option-chain liquidity, IV percentile, delta, expiry, OI and earnings events are not automatically validated.
+- Paper journal uses underlying points and is not persistent after Streamlit restart.
+- A full historical option-premium backtest is not provided.
