@@ -67,12 +67,26 @@ def num(x, default=np.nan) -> float:
 
 
 def show(df, **kw):
-    """st.dataframe that works on old and new Streamlit versions."""
+    """Dark-readable tables; candle rows use the requested Open > Close green rule."""
     kw.setdefault('hide_index', True)
+    display = df
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        if {'Open', 'Close'}.issubset(df.columns):
+            def candle_colors(r):
+                op, cl = pd.to_numeric(r['Open'], errors='coerce'), pd.to_numeric(r['Close'], errors='coerce')
+                if pd.isna(op) or pd.isna(cl):
+                    return [''] * len(r)
+                # Requested mapping: Open > Close GREEN; Open < Close RED.
+                col = '#34f5ae' if op > cl else '#ff688b' if op < cl else '#e9f3ff'
+                return [f'color: {col}; background-color: #102033' for _ in r]
+            display = df.style.apply(candle_colors, axis=1).set_table_styles([
+                {'selector': 'th', 'props': [('background-color', '#14243a'), ('color', '#eaf4ff')]},
+                {'selector': 'td', 'props': [('border-color', '#283e59')]},
+            ])
     try:
-        st.dataframe(df, width='stretch', **kw)
+        st.dataframe(display, width='stretch', **kw)
     except TypeError:
-        st.dataframe(df, use_container_width=True, **kw)
+        st.dataframe(display, use_container_width=True, **kw)
 
 
 # =====================================================================================
@@ -945,6 +959,35 @@ def apply_dark_theme():
     .signal-pill {display:inline-block;background:#263958;color:#dcf6ff;padding:5px 10px;border-radius:20px;font-size:.75rem;}
     .signal-levels {color:#d2e4f7;font-size:.82rem;line-height:1.9;}
     .signal-good {color:#37e6b1;} .signal-bad {color:#ff9dba;}
+    /* Explicit text colors: Streamlit's default light-theme text was black on dark. */
+    .stApp, .stApp p, .stApp span, .stApp label, .stApp li,
+    [data-testid="stSidebar"] p, [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] label, [data-testid="stWidgetLabel"] *,
+    [data-testid="stMarkdownContainer"] {color:#eaf2ff;}
+    [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * {color:#a8bed9!important;}
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] *,
+    [data-testid="stSidebar"] label {color:#d9e8ff!important;}
+    [data-testid="stTabs"] button, [data-testid="stTabs"] button p,
+    [data-testid="stTabs"] button span {color:#c6d7f0!important;}
+    [data-testid="stTabs"] button[aria-selected="true"] *,
+    [data-testid="stTabs"] button[aria-selected="true"] {color:#70f3da!important;}
+    [data-testid="stMetricLabel"] *, [data-testid="stMetricLabel"] {color:#b9cfe9!important;}
+    [data-testid="stMetricValue"] *, [data-testid="stMetricValue"] {color:#69eaff!important;}
+    [data-testid="stMetricDelta"] * {color:#a9d8ff!important;}
+    [data-testid="stCheckbox"] label *, [data-testid="stRadio"] label * {color:#eaf2ff!important;}
+    [data-testid="stSlider"] *, [data-testid="stNumberInput"] label *,
+    [data-testid="stSelectbox"] label * {color:#dcecff!important;}
+    [data-testid="stNumberInput"] input, [data-testid="stTextInput"] input,
+    [data-testid="stTextArea"] textarea, [data-testid="stSelectbox"] div[data-baseweb="select"] > div {
+        background:#17263d!important; color:#f3f8ff!important; border-color:#375170!important;
+    }
+    [data-testid="stNumberInput"] input, [data-testid="stTextInput"] input {color:#f3f8ff!important;}
+    [data-testid="stDataFrame"] {background:#101c2e!important;}
+    [data-testid="stAlert"] {border-radius:12px;}
+    div.stButton > button {background:#1c3150;color:#f4faff!important;border:1px solid #47658b;border-radius:10px;}
+    div.stButton > button * {color:#f4faff!important;}
+    div.stButton > button:hover {border-color:#69eaff;color:#69eaff!important;}
+    /* Charts rendered by Vega/Altair inherit theme from Streamlit config. */
     </style>""", unsafe_allow_html=True)
 
 
@@ -1321,6 +1364,7 @@ def main():
                     daily = load_daily(DhanAPI(token, client_id), cache, x, last_complete_session())
                     d = indicators(daily).tail(120)
                     st.line_chart(d[['Close', 'ema21', 'ema50', 'ema200']])
+                    st.caption('Candle table colors (as requested): 🟢 Open > Close · 🔴 Open < Close · ⚪ Equal')
                     show(d.tail(10)[['Open', 'High', 'Low', 'Close', 'Volume', 'ema9', 'ema21', 'adx', 'rsi', 'st_dir', 'cpr_width']].round(2).reset_index(), hide_index=True)
                 except Exception as e:
                     st.error(f'Chart unavailable: {e}')

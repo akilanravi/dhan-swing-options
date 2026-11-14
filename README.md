@@ -28,3 +28,6 @@ Never commit secrets to GitHub. Gist write access is required for permanent pape
 - Monthly setup eligibility is inherited from the existing strategy; it can be stale and should be paper-tested first.
 - Institutional flows are market-wide, not stock-specific, and may be delayed.
 - Dhan API limits apply to option chain requests.
+
+
+V3.9 VISIBILITY FIX: Upload the `.streamlit/config.toml` folder to the repository root as well as app.py. All UI text is high-contrast. In Trade Analysis, candle table rows are green when Open > Close and red when Open < Close, per requested convention (the reverse of standard candlestick conventions). No trading logic changed.
