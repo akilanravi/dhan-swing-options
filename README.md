@@ -16,3 +16,10 @@ Deploy to Streamlit Cloud with `app.py` and `requirements.txt` at repository roo
 - Option-chain liquidity, IV percentile, delta, expiry, OI and earnings events are not automatically validated.
 - Paper journal uses underlying points and is not persistent after Streamlit restart.
 - A full historical option-premium backtest is not provided.
+
+## V3.6 Moneycontrol institutional data
+- The dashboard requests Moneycontrol's public cash-market FII/DII table at launch and re-fetches on each explicit scan. No Moneycontrol credentials required.
+- Latest published date, net FII/DII, five-session totals, month-to-date totals and source link are displayed. Published values are not live intraday flows.
+- If the website blocks automated access or changes layout, the dashboard displays UNAVAILABLE rather than guessing. Cloud connectivity to Moneycontrol is not guaranteed.
+- This is market-wide sentiment, not company-specific institutional buying, and does not override technical entry rules.
+- New dependency: beautifulsoup4. Upload all six files to the repository root.

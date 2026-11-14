@@ -5,10 +5,11 @@ import pandas as pd
 import streamlit as st
 from dhan_api import DhanAPI, read_instrument_master, build_universe
 from signals import indicators, annotate, score, rejection_reasons
+from institutional import fetch_moneycontrol_flows, summarize
 
 st.set_page_config(page_title='Dhan Swing Options V3', page_icon='📊', layout='wide')
-st.title('Dhan Swing Options V3.5 | Monthly Trend + F&O Scanner')
-st.caption('Dhan API only · Manual execution · No Telegram · No Yahoo · No automatic orders · FII/DII optional manual context')
+st.title('Dhan Swing Options V3.6 | Monthly Scanner + Institutional Flows')
+st.caption('Dhan API for trading data · Moneycontrol for published institutional cash flows · No Telegram · No Yahoo · Manual orders only')
 
 try:
     secret_token = st.secrets.get('DHAN_ACCESS_TOKEN', '')
@@ -32,12 +33,27 @@ with st.sidebar:
     index_vol = st.checkbox('Include indices in scanner', value=True)
     st.caption('Index spot volume may be zero. Such index signals remain unconfirmed and cannot become eligible trades.')
     events = st.text_area('Event blackout dates (YYYY-MM-DD, one per line)', '')
-    st.header('Institutional context (optional)')
-    st.caption('FII/DII cash-market totals are market-wide, not stock-specific. Dhan candle API does not supply verified FII/DII flows. Leave blank unless sourced and dated.')
-    fii = st.number_input('FII net cash flow ₹ crore (manual; 0 = unknown)', value=0.0, step=100.0)
-    dii = st.number_input('DII net cash flow ₹ crore (manual; 0 = unknown)', value=0.0, step=100.0)
-    flow_date = st.date_input('Institutional flow as-of date', value=date.today())
-    st.caption('FII/DII is informational only and never overrides technical or option liquidity gates.')
+    st.caption('Moneycontrol institutional flows are published cash-market totals, not live intraday ticks. Each scan attempts a fresh fetch.')
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_flows():
+    return summarize(fetch_moneycontrol_flows())
+
+flows = None
+flow_error = None
+try:
+    flows = cached_flows()
+except Exception as exc:
+    flow_error = str(exc)
+with st.sidebar:
+    st.header('Institutional data · Moneycontrol')
+    if flows:
+        st.write(f"Latest published: {flows['date']}")
+        st.write(f"FII ₹Cr: {flows['fii_net']:+,.2f} | DII ₹Cr: {flows['dii_net']:+,.2f}")
+        st.caption(f"5-session sentiment: {flows['sentiment']}")
+    else:
+        st.warning('Institutional data unavailable — no figures assumed')
+        st.caption(flow_error or '')
 
 if 'scan' not in st.session_state: st.session_state.scan = pd.DataFrame()
 if 'history' not in st.session_state: st.session_state.history = pd.DataFrame()
@@ -88,6 +104,13 @@ with t1:
     offset = st.number_input('Start at stock number', 1, 1000, 1, 10)
     st.caption('Stock numbering starts at 1. The universe is loaded automatically.')
     if st.button('Scan selected batch', disabled=not token, type='primary'):
+        cached_flows.clear()  # fresh public-data attempt on each explicit scan
+        try:
+            flows = cached_flows()
+            flow_error = None
+        except Exception as exc:
+            flows = None
+            flow_error = str(exc)
         api = DhanAPI(token, client_id=client_id)
         today = date.today()
         stocks = [] if u.empty else u.iloc[int(offset)-1:int(offset)-1+int(scan_limit)].to_dict('records')
@@ -141,7 +164,7 @@ with t1:
                     if any(abs((d.index[-1].date()-pd.Timestamp(e).date()).days)<=3 for e in blackouts): hard_blocks.append('Event blackout')
                     status = 'FRESH ENTRY' if eligible and not hard_blocks else ('MONTHLY TRIGGER WATCH' if best >= 8 and last_trigger and not hard_blocks else ('STRONG WATCHLIST' if best >= 8 and directional else 'REJECTED'))
                     row = {'Symbol':x['symbol'],'Date':d.index[-1].strftime('%Y-%m-%d'),
-                           'Side':side,'Score':int(best),'Eligible':bool(status == 'FRESH ENTRY'),'Status':status,'Monthly trend':monthly_trend,'MTD %':round(mtd,2),'Last monthly trigger':last_trigger,'Monthly trigger':bool(last_trigger),'Hard blocks':'; '.join(hard_blocks),'FII net ₹Cr (market)':fii if fii else None,'DII net ₹Cr (market)':dii if dii else None,'Flow date':str(flow_date) if fii or dii else '', 'Close':entry,
+                           'Side':side,'Score':int(best),'Eligible':bool(status == 'FRESH ENTRY'),'Status':status,'Monthly trend':monthly_trend,'MTD %':round(mtd,2),'Last monthly trigger':last_trigger,'Monthly trigger':bool(last_trigger),'Hard blocks':'; '.join(hard_blocks),'FII net ₹Cr (market)':flows['fii_net'] if flows else None,'DII net ₹Cr (market)':flows['dii_net'] if flows else None,'Flow date':flows['date'] if flows else '', 'FII 5D ₹Cr':flows['fii_5d'] if flows else None,'DII 5D ₹Cr':flows['dii_5d'] if flows else None,'FII MTD ₹Cr':flows['fii_mtd'] if flows else None,'DII MTD ₹Cr':flows['dii_mtd'] if flows else None,'Institutional sentiment':flows['sentiment'] if flows else 'UNAVAILABLE', 'Close':entry,
                            'Underlying SL':entry-direction*risk,'Target 1 (1R)':entry+direction*risk,
                            'Target 2 (2R)':entry+direction*2*risk,
                            'ADX':float(r.adx),'RSI':float(r.rsi),'Volume OK':volok,
@@ -166,6 +189,18 @@ with t1:
             st.session_state.scan_errors = pd.DataFrame(errors)
             if errors: st.warning(f'{len(errors)} instruments failed'); st.dataframe(pd.DataFrame(errors),hide_index=True)
             if errors: st.download_button('Download API errors CSV',pd.DataFrame(errors).to_csv(index=False),file_name='dhan_api_errors.csv')
+    st.subheader('Moneycontrol institutional cash flows')
+    if flows:
+        st.caption(f"Published as of {flows['date']}; refreshes on every Scan selected batch. Not live intraday data. Market-wide, not individual-stock flows.")
+        f1,f2,f3 = st.columns(3)
+        f1.metric('FII net ₹Cr (latest)', f"{flows['fii_net']:+,.2f}")
+        f2.metric('DII net ₹Cr (latest)', f"{flows['dii_net']:+,.2f}")
+        f3.metric('5-session sentiment', flows['sentiment'])
+        st.dataframe(pd.DataFrame(flows['rows']), use_container_width=True, hide_index=True)
+        st.link_button('Moneycontrol source', flows['source'])
+    else:
+        st.warning('Institutional data unavailable. This is not a zero-flow reading. ' + (flow_error or ''))
+    st.caption('Institutional cash flows provide contextual market sentiment; they do not override technical entry gates or establish stock-specific buying.')
     if not st.session_state.scan.empty:
         st.caption('Only the latest completed daily candle is eligible for a new entry; prior signals are historical.')
         st.subheader('Latest batch results — eligible first')
