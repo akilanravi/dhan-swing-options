@@ -614,15 +614,15 @@ def select_contract(df, side, spot, p):
     return best, cands, ''
 
 
-def size_position(capital, risk_pct, premium, lot, sl_frac, max_exposure_pct):
+def size_position(capital, risk_pct, premium, lot, sl_frac, max_exposure_pct, max_trade_rupees=35000):
     if not (premium > 0 and lot > 0):
         return 0, 0.0, 0.0, 'Premium or lot size missing'
     risk_budget = capital * risk_pct / 100
     by_risk = math.floor(risk_budget / (premium * sl_frac * lot))
-    by_exp = math.floor(capital * max_exposure_pct / 100 / (premium * lot))
+    by_exp = math.floor(min(capital * max_exposure_pct / 100, max_trade_rupees) / (premium * lot))
     lots = max(0, min(by_risk, by_exp))
     note = '' if lots >= 1 else (f'One lot costs Rs {premium * lot:,.0f} (max loss Rs {premium * sl_frac * lot:,.0f}); '
-                                  f'risk budget Rs {risk_budget:,.0f}, exposure cap Rs {capital * max_exposure_pct / 100:,.0f} -> NO TRADE')
+                                  f'risk budget Rs {risk_budget:,.0f}, portfolio exposure cap Rs {capital * max_exposure_pct / 100:,.0f}, per-trade cap Rs {max_trade_rupees:,.0f} -> NO TRADE')
     return lots, lots * premium * lot, lots * premium * sl_frac * lot, note
 
 
@@ -675,7 +675,7 @@ def option_for_setup(api, row, p, seg_memory):
         return base
     premium = float(pick.ask) if pick.ask > 0 else float(pick.ltp)
     lot = num(row.get('Lot size'))
-    lots, outlay, maxloss, note = size_position(p['capital'], p['risk_pct'], premium, lot if lot == lot else 0, p['sl_frac'], p['max_exposure'])
+    lots, outlay, maxloss, note = size_position(p['capital'], p['risk_pct'], premium, lot if lot == lot else 0, p['sl_frac'], p['max_exposure'], p['max_trade_rupees'])
     strike = float(pick.strike)
     delta = abs(float(pick.delta)) * (1 if side == 'CE' else -1)
     base.update({
@@ -870,10 +870,11 @@ def journal_stats(df):
             'Max drawdown Rs': round(float((eq - eq.cummax()).min()), 2)}, eq
 
 
-def entry_guard(df, sym, side, new_exposure, capital, max_open, max_exposure_pct, weekly_limit_pct):
+def entry_guard(df, sym, side, new_exposure, capital, max_open, max_exposure_pct, weekly_limit_pct, max_trade_rupees=35000):
     """Spec risk rules. Returns list of blocking messages."""
     msgs = []
     openr = df[df.status == 'OPEN']
+    if new_exposure > max_trade_rupees: msgs.append(f'Per-trade premium cap Rs {max_trade_rupees:,.0f} exceeded')
     if len(openr) >= max_open: msgs.append(f'Max {max_open} open trades reached')
     if sym in set(openr.symbol): msgs.append('Already open in this instrument')
     corr = [s for s in openr.symbol if s in INDEX_GROUP]
@@ -1064,7 +1065,8 @@ def main():
         capital = st.number_input('Capital (Rs)', 10000, 100000000, 100000, 5000)
         risk_pct = st.slider('Risk per trade (%)', 1.0, 2.0, 1.0, 0.5)
         max_open = st.number_input('Max open trades', 1, 10, 3)
-        max_exposure = st.slider('Max premium exposure (% capital)', 5, 50, 20)
+        max_exposure = st.slider('Max premium exposure (% capital)', 5, 50, 35)
+        max_trade_rupees = st.number_input('Maximum premium per paper trade (Rs)', min_value=1000, max_value=1000000, value=35000, step=1000, help='Separate from stop-loss risk. A trade must satisfy both limits.')
         weekly_limit = st.slider('Weekly loss limit (% capital)', 1.0, 10.0, 4.0, 0.5)
         st.header('Signal rules')
         min_score = st.slider('Min score - fresh entry', 7, 10, 7)
@@ -1093,7 +1095,7 @@ def main():
         slip = st.slider('Exit slippage (%)', 0.0, 3.0, 0.5, 0.1)
 
     opt_params = {'capital': capital, 'risk_pct': risk_pct, 'min_days': int(min_days), 'delta_lo': d_lo, 'delta_hi': d_hi,
-                  'max_spread': max_spread, 'sl_frac': sl_frac, 'max_exposure': max_exposure}
+                  'max_spread': max_spread, 'sl_frac': sl_frac, 'max_exposure': max_exposure, 'max_trade_rupees': max_trade_rupees}
     blackouts = [x.strip() for x in events.splitlines() if x.strip()]
 
     # ---- FII/DII resolution
@@ -1202,7 +1204,7 @@ def main():
                     exp = pd.to_datetime(opt.get('Expiry'), errors='coerce')
                     if pd.isna(exp) or (exp.date()-today).days < int(min_days):
                         continue
-                    bad = entry_guard(ss.paper, sym, row['Side'], prem*lot*lots, capital, int(max_open), max_exposure, weekly_limit)
+                    bad = entry_guard(ss.paper, sym, row['Side'], prem*lot*lots, capital, int(max_open), max_exposure, weekly_limit, max_trade_rupees)
                     if bad:
                         notes.append(f'{sym}: '+ '; '.join(bad))
                         continue
@@ -1507,7 +1509,7 @@ def main():
                 lot = int(num(fresh.get('Lot size'), 0))
                 lots = int(num(fresh.get('Lots'), 0))
                 exp = pd.to_datetime(fresh.get('Expiry'), errors='coerce')
-                bad = entry_guard(ss.paper, sym, row.Side, prem*lot*lots, capital, int(max_open), max_exposure, weekly_limit)
+                bad = entry_guard(ss.paper, sym, row.Side, prem*lot*lots, capital, int(max_open), max_exposure, weekly_limit, max_trade_rupees)
                 if fresh.get('Verdict') != 'TRADE' or not np.isfinite(prem) or prem <= 0 or lot < 1 or lots < 1 or pd.isna(exp):
                     bad.append('Dhan option contract / expiry / ask / lot validation failed')
                 if pd.notna(exp) and (exp.date() - datetime.now(IST).date()).days < min_days:
