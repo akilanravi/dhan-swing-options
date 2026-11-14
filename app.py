@@ -43,6 +43,18 @@ config = {'min_score': min_score, 'max_weekly_cpr_width': cpr_width,
           'event_blackout_dates': {}}
 blackouts = [x.strip() for x in events.splitlines() if x.strip()]
 
+# Cached public master and completed daily candles; cache is shared across reruns.
+# Access token is part of the cache key to avoid cross-account reuse.
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_master():
+    return read_instrument_master()
+
+@st.cache_data(ttl=21600, max_entries=1200, show_spinner=False)
+def cached_daily(token_value, client_value, sid, segment, instrument, through_date):
+    api = DhanAPI(token_value, client_id=client_value)
+    end = pd.Timestamp(through_date).date() + timedelta(days=1)
+    return api.candles(sid, segment, instrument, end-timedelta(days=400), end)
+
 t1,t2,t3,t4 = st.tabs(['1 · Market scanner','2 · Top CE/PE setups','3 · Trade analysis','4 · Paper trading'])
 with t1:
     st.subheader('Automatically load current NSE F&O universe')
@@ -50,7 +62,7 @@ with t1:
     if st.button('Load Dhan instrument master', type='primary'):
         try:
             with st.spinner('Loading instrument master…'):
-                master = read_instrument_master()
+                master = cached_master()
                 universe = build_universe(master)
                 if universe.empty: raise ValueError('No matched F&O equities. Dhan master schema or symbol matching needs adjustment; inspect source CSV.')
                 st.session_state.master = master
@@ -61,7 +73,7 @@ with t1:
     if not u.empty:
         st.write(f'{len(u)} F&O equity underlyings identified from current master')
         st.dataframe(u.head(25), use_container_width=True, hide_index=True)
-    st.info('Dhan API limits apply. The scanner processes a bounded batch on demand, not every symbol continuously. Re-run subsequent batches to cover the whole universe.')
+    st.info('First scan downloads historical candles (approximately 5 requests per stock); repeat scans reuse cached candles for 6 hours. Dhan API limits still apply. Scan in batches.')
     offset = st.number_input('Start at stock number', 1, 1000, 1, 10)
     if st.button('Scan selected batch', disabled=not token, type='primary'):
         api = DhanAPI(token, client_id=client_id)
@@ -77,7 +89,7 @@ with t1:
             for i, x in enumerate(stocks):
                 try:
                     # ~350 calendar days for EMA200 warm-up, 85-day bounded Dhan requests.
-                    daily = api.candles(x['sid'],x['segment'],x['instrument'], today-timedelta(days=480), today+timedelta(days=1))
+                    daily = cached_daily(token, client_id, x['sid'], x['segment'], x['instrument'], today.isoformat())
                     if len(daily) < 220: raise ValueError(f'Only {len(daily)} candles (need 220+)')
                     cfg = dict(config)
                     cfg['event_blackout_dates'] = {x['symbol']:blackouts}

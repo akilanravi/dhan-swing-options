@@ -25,3 +25,12 @@ Upload `app.py`, `dhan_api.py`, `signals.py`, `requirements.txt` to the root of 
 - Adds Dhan client-id header for option-chain requests and a missing-client-ID diagnostic.
 - Excludes TEST/DUMMY/MOCK entries from discovered F&O stock underlyings.
 - Option-chain calls still require a valid token, correct client ID and Dhan permissions.
+
+
+## V3.3 performance update
+- Dhan instrument master cached for 24 hours using Streamlit cache_data.
+- Daily historical candles cached for 6 hours, per account/instrument/day.
+- Daily warm-up fetch reduced to 400 calendar days (~5 Dhan 85-day chunks per uncached stock).
+- Subsequent batch scans reuse cached history. First full-universe scan still requires many API requests and can be slow; rate limits apply.
+- To refresh stale data, wait for cache TTL or clear Streamlit cache. Do not place access tokens in GitHub.
+- Cache is ephemeral on Streamlit Community Cloud; app restarts can clear it.
