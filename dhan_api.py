@@ -70,37 +70,61 @@ class DhanAPI:
 
 
 def read_instrument_master(uploaded=None):
+    """Fetch current public Dhan scrip master automatically; no user CSV needed."""
     if uploaded is None:
-        r = requests.get(MASTER_URL, timeout=45)
+        r = requests.get(MASTER_URL, timeout=90, headers={'User-Agent': 'Mozilla/5.0'})
         r.raise_for_status()
-        return pd.read_csv(io.BytesIO(r.content), low_memory=False)
-    return pd.read_csv(uploaded, low_memory=False)
+        return pd.read_csv(io.BytesIO(r.content), low_memory=False, dtype=str)
+    return pd.read_csv(uploaded, low_memory=False, dtype=str)
 
 
 def build_universe(master):
-    # Detailed Dhan instrument master schema; fail visibly if Dhan changes it.
-    names = {str(c).strip().upper(): c for c in master.columns}
-    needed = ['SEM_EXM_EXCH_ID','SEM_SEGMENT','SEM_INSTRUMENT_NAME','SEM_SMST_SECURITY_ID','SEM_TRADING_SYMBOL']
-    missing = [x for x in needed if x not in names]
-    if missing: raise ValueError('Dhan master columns changed. Missing: '+', '.join(missing)+'; available: '+', '.join(map(str, master.columns[:20])))
-    m = master.rename(columns={names[k]:k for k in needed}).copy()
-    seg = m.SEM_SEGMENT.astype(str).str.upper()
-    inst = m.SEM_INSTRUMENT_NAME.astype(str).str.upper()
-    exch = m.SEM_EXM_EXCH_ID.astype(str).str.upper()
-    # NSE F&O stock universe from current futures stock contracts, deduplicated.
-    fut = m[(exch == 'NSE') & (seg.str.contains('FNO|F&O|DERIV', regex=True)) & (inst == 'FUTSTK')].copy()
-    if fut.empty:
-        # Different Dhan master releases encode segment differently.
-        fut = m[(exch == 'NSE') & (inst == 'FUTSTK')].copy()
-    # Equity spot IDs must be looked up separately; futures IDs are not equity IDs.
-    eq = m[(exch == 'NSE') & (inst.isin(['EQUITY','EQ']))].copy()
-    eq['key'] = eq.SEM_TRADING_SYMBOL.astype(str).str.upper().str.strip()
-    eq = eq.drop_duplicates('key')
-    fut['key'] = fut.SEM_TRADING_SYMBOL.astype(str).str.upper().str.replace(r'[- ]?\d{2}[A-Z]{3}FUT$', '', regex=True).str.strip()
-    keys = set(fut.key)
-    universe = eq[eq.key.isin(keys)].copy()
-    universe['symbol'] = universe['key']
-    universe['sid'] = universe.SEM_SMST_SECURITY_ID.astype(str).str.replace(r'\.0$', '', regex=True)
-    universe['segment'] = 'NSE_EQ'
-    universe['instrument'] = 'EQUITY'
-    return universe[['symbol','sid','segment','instrument']].drop_duplicates('symbol').sort_values('symbol').reset_index(drop=True)
+    """Derive active F&O stock underlyings, mapping to NSE_EQ spot IDs."""
+    m = master.copy()
+    m.columns = [str(c).strip().upper() for c in m.columns]
+    aliases = {
+        'EXCH_ID': ['EXCH_ID','SEM_EXM_EXCH_ID'],
+        'SEGMENT': ['SEGMENT','SEM_SEGMENT'],
+        'SECURITY_ID': ['SECURITY_ID','SEM_SMST_SECURITY_ID'],
+        'INSTRUMENT': ['INSTRUMENT','INSTRUMENT_TYPE','SEM_INSTRUMENT_NAME'],
+        'SYMBOL_NAME': ['SYMBOL_NAME','SEM_TRADING_SYMBOL','DISPLAY_NAME'],
+    }
+    for canonical, variants in aliases.items():
+        for v in variants:
+            if v in m.columns:
+                m[canonical] = m[v]
+                break
+        else:
+            raise ValueError(f'Dhan master missing {canonical}; available columns: {list(m.columns)}')
+    def norm(col):
+        return m[col].fillna('').astype(str).str.upper().str.strip()
+    exch, seg, inst = norm('EXCH_ID'), norm('SEGMENT'), norm('INSTRUMENT')
+    # NSE equity futures are FUTSTK (some releases use FUT or FUTURE).
+    futures = m[(exch.eq('NSE') | seg.str.contains('NSE')) &
+                (inst.str.contains('FUTSTK') | ((inst == 'FUT') & norm('SEGMENT').str.contains('FNO|F&O|DERIV')))].copy()
+    if futures.empty:
+        raise ValueError('No NSE stock futures found in current Dhan master. Check master instrument values.')
+    if 'UNDERLYING_SYMBOL' in futures.columns:
+        futures['key'] = futures['UNDERLYING_SYMBOL'].fillna('').str.upper().str.strip()
+    else:
+        futures['key'] = futures['SYMBOL_NAME'].fillna('').str.upper().str.replace(r'[- ]?\d{2}[A-Z]{3}FUT$', '', regex=True).str.strip()
+    keys = set(futures['key']) - {''}
+    # Spot candles must use the equity spot security ID, NOT the futures contract ID.
+    equity = m[(exch.eq('NSE') | seg.eq('NSE_EQ')) &
+               (inst.isin(['EQUITY','EQ']) | seg.eq('NSE_EQ'))].copy()
+    equity['key'] = equity['SYMBOL_NAME'].fillna('').str.upper().str.strip()
+    if 'UNDERLYING_SYMBOL' in equity.columns:
+        equity['key'] = equity['UNDERLYING_SYMBOL'].where(equity['UNDERLYING_SYMBOL'].fillna('').ne(''), equity['key']).astype(str).str.upper().str.strip()
+    equity = equity[equity['key'].isin(keys)].copy()
+    if 'SERIES' in equity.columns:
+        equity = equity[equity['SERIES'].fillna('EQ').astype(str).str.upper().isin(['EQ',''])]
+    equity = equity.drop_duplicates('key')
+    equity['symbol'] = equity['key']
+    equity['sid'] = equity['SECURITY_ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+    equity['segment'] = 'NSE_EQ'
+    equity['instrument'] = 'EQUITY'
+    result = equity[['symbol','sid','segment','instrument']].dropna()
+    result = result[result['sid'].str.fullmatch(r'\d+')].drop_duplicates('symbol').sort_values('symbol').reset_index(drop=True)
+    if result.empty:
+        raise ValueError(f'Found {len(keys)} F&O symbols but no matching NSE equity IDs. Sample F&O symbols: {sorted(keys)[:8]}')
+    return result

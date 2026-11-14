@@ -6,7 +6,7 @@ from dhan_api import DhanAPI, read_instrument_master, build_universe
 from signals import indicators, annotate, score
 
 st.set_page_config(page_title='Dhan Swing Options V3', page_icon='📊', layout='wide')
-st.title('Dhan Swing Options V3 | F&O Scanner + Paper Trading')
+st.title('Dhan Swing Options V3.1 | F&O Scanner + Paper Trading')
 st.caption('Dhan API only · Manual execution · No Telegram · No Yahoo · No automatic orders')
 
 try:
@@ -41,12 +41,12 @@ blackouts = [x.strip() for x in events.splitlines() if x.strip()]
 
 t1,t2,t3,t4 = st.tabs(['1 · Market scanner','2 · Top CE/PE setups','3 · Trade analysis','4 · Paper trading'])
 with t1:
-    st.subheader('Load current NSE F&O universe')
-    uploaded = st.file_uploader('Optional: upload current Dhan detailed instrument master CSV', type='csv')
+    st.subheader('Automatically load current NSE F&O universe')
+    st.caption('Automatically downloads the current Dhan instrument master. No file upload needed.')
     if st.button('Load Dhan instrument master', type='primary'):
         try:
             with st.spinner('Loading instrument master…'):
-                master = read_instrument_master(uploaded)
+                master = read_instrument_master()
                 universe = build_universe(master)
                 if universe.empty: raise ValueError('No matched F&O equities. Dhan master schema or symbol matching needs adjustment; inspect source CSV.')
                 st.session_state.master = master
