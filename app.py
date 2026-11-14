@@ -11,11 +11,15 @@ st.caption('Dhan API only · Manual execution · No Telegram · No Yahoo · No a
 
 try:
     secret_token = st.secrets.get('DHAN_ACCESS_TOKEN', '')
+    secret_client_id = st.secrets.get('DHAN_CLIENT_ID', '')
 except Exception:
     secret_token = ''
+    secret_client_id = ''
 with st.sidebar:
     st.header('Dhan connection')
     token = st.text_input('Access token', value=os.getenv('DHAN_ACCESS_TOKEN', secret_token), type='password')
+    client_id = os.getenv('DHAN_CLIENT_ID', secret_client_id)
+    st.caption('Option-chain client ID: ' + ('configured' if client_id else 'MISSING — add DHAN_CLIENT_ID in Streamlit Secrets'))
     capital = st.number_input('Capital (₹)', 1000, 100000000, 100000, 5000)
     risk_pct = st.slider('Risk per trade (%)', 1.0, 2.0, 1.0, .5)
     cpr_width = st.slider('Maximum weekly CPR width (%)', .1, 5.0, 1.5, .1) / 100
@@ -60,7 +64,7 @@ with t1:
     st.info('Dhan API limits apply. The scanner processes a bounded batch on demand, not every symbol continuously. Re-run subsequent batches to cover the whole universe.')
     offset = st.number_input('Start at stock number', 1, 1000, 1, 10)
     if st.button('Scan selected batch', disabled=not token, type='primary'):
-        api = DhanAPI(token)
+        api = DhanAPI(token, client_id=client_id)
         today = date.today()
         stocks = [] if u.empty else u.iloc[int(offset)-1:int(offset)-1+int(scan_limit)].to_dict('records')
         if index_vol:
@@ -139,7 +143,7 @@ with t3:
         st.warning('Entry, SL and targets are underlying reference levels, NOT option premium prices. No strike, expiry, premium, lot size or rupee risk can be confirmed without a validated option chain.')
         if token:
             st.subheader('Option chain — manual inspection')
-            api = DhanAPI(token)
+            api = DhanAPI(token, client_id=client_id)
             mapping = {'NIFTY':('13','IDX_I'),'BANKNIFTY':('25','IDX_I')}
             if chosen in mapping: sid,seg=mapping[chosen]
             else:

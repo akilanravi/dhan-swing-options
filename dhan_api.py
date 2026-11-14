@@ -8,9 +8,10 @@ BASE = 'https://api.dhan.co/v2'
 MASTER_URL = 'https://images.dhan.co/api-data/api-scrip-master-detailed.csv'
 
 class DhanAPI:
-    def __init__(self, token):
+    def __init__(self, token, client_id=None):
         if not token: raise ValueError('Dhan access token is required')
         self.session = requests.Session()
+        self.client_id = str(client_id or '').strip()
         self.session.headers.update({'access-token': token, 'Content-Type': 'application/json', 'Accept': 'application/json'})
 
     def post(self, path, payload):
@@ -62,10 +63,17 @@ class DhanAPI:
         for c in ['Open','High','Low','Close','Volume']: d[c] = pd.to_numeric(d[c], errors='coerce')
         return d.dropna(subset=['Open','High','Low','Close'])
 
+    def _option_auth(self):
+        if not self.client_id:
+            raise ValueError('DHAN_CLIENT_ID is missing. Set it in Streamlit Cloud Secrets; do not use the underlying security ID as client ID.')
+        self.session.headers['client-id'] = self.client_id
+
     def expiries(self, sid, segment):
+        self._option_auth()
         return self.post('/optionchain/expirylist', {'UnderlyingScrip': int(sid), 'UnderlyingSeg': segment})
 
     def chain(self, sid, segment, expiry):
+        self._option_auth()
         return self.post('/optionchain', {'UnderlyingScrip': int(sid), 'UnderlyingSeg': segment, 'Expiry': expiry})
 
 
@@ -108,6 +116,7 @@ def build_universe(master):
         futures['key'] = futures['UNDERLYING_SYMBOL'].fillna('').str.upper().str.strip()
     else:
         futures['key'] = futures['SYMBOL_NAME'].fillna('').str.upper().str.replace(r'[- ]?\d{2}[A-Z]{3}FUT$', '', regex=True).str.strip()
+    futures = futures[~futures['key'].str.contains(r'TEST|DUMMY|MOCK', case=False, na=False)]
     keys = set(futures['key']) - {''}
     # Spot candles must use the equity spot security ID, NOT the futures contract ID.
     equity = m[(exch.eq('NSE') | seg.eq('NSE_EQ')) &
@@ -124,7 +133,8 @@ def build_universe(master):
     equity['segment'] = 'NSE_EQ'
     equity['instrument'] = 'EQUITY'
     result = equity[['symbol','sid','segment','instrument']].dropna()
-    result = result[result['sid'].str.fullmatch(r'\d+')].drop_duplicates('symbol').sort_values('symbol').reset_index(drop=True)
+    result = result[result['sid'].str.fullmatch(r'\d+')].drop_duplicates('symbol')
+    result = result[~result['symbol'].str.contains(r'TEST|DUMMY|MOCK', case=False, na=False)].sort_values('symbol').reset_index(drop=True)
     if result.empty:
         raise ValueError(f'Found {len(keys)} F&O symbols but no matching NSE equity IDs. Sample F&O symbols: {sorted(keys)[:8]}')
     return result

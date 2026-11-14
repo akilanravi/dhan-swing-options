@@ -3,7 +3,7 @@
 Streamlit research dashboard with Dhan-only F&O universe scanning, score-ranked CE/PE signals and a session-based paper journal.
 
 ## Deploy
-Upload `app.py`, `dhan_api.py`, `signals.py`, `requirements.txt` to the root of your existing GitHub repository (replace old files). Streamlit Cloud entrypoint: `app.py`. Add `DHAN_ACCESS_TOKEN = "..."` in Streamlit Cloud Secrets (never commit secrets).
+Upload `app.py`, `dhan_api.py`, `signals.py`, `requirements.txt` to the root of your existing GitHub repository (replace old files). Streamlit Cloud entrypoint: `app.py`. Add both `DHAN_ACCESS_TOKEN = "..."` and `DHAN_CLIENT_ID = "..."` in Streamlit Cloud Secrets (never commit secrets).
 
 ## Usage
 1. Load the Dhan detailed instrument master. If the download fails, upload a current CSV from Dhan.
@@ -20,3 +20,8 @@ Upload `app.py`, `dhan_api.py`, `signals.py`, `requirements.txt` to the root of 
 - The paper journal uses underlying price points only, not actual option returns. Session state is ephemeral on Streamlit Cloud.
 - Index IDs 13 and 25 are starting mappings and must be verified against Dhan master.
 - No automated orders or brokerage charges; not a production-ready live execution system.
+
+## V3.2 fixes
+- Adds Dhan client-id header for option-chain requests and a missing-client-ID diagnostic.
+- Excludes TEST/DUMMY/MOCK entries from discovered F&O stock underlyings.
+- Option-chain calls still require a valid token, correct client ID and Dhan permissions.
