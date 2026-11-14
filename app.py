@@ -572,7 +572,7 @@ def parse_chain(resp):
             g = leg.get('greeks') or {}
             rows.append({'strike': strike, 'type': typ.upper(), 'ltp': num(leg.get('last_price')),
                          'bid': num(leg.get('top_bid_price')), 'ask': num(leg.get('top_ask_price')),
-                         'delta': num(g.get('delta')), 'iv': num(leg.get('implied_volatility')),
+                         'delta': num(g.get('delta')), 'theta': num(g.get('theta')), 'gamma': num(g.get('gamma')), 'vega': num(g.get('vega')), 'iv': num(leg.get('implied_volatility')),
                          'oi': num(leg.get('oi')), 'volume': num(leg.get('volume'))})
     return spot, pd.DataFrame(rows)
 
@@ -640,8 +640,7 @@ def option_for_setup(api, row, p, seg_memory):
     """Fetch expiries + chain, return a dict describing the proposed contract (or why not)."""
     sym, side = row['Symbol'], row['Side']
     sid = str(row['sid'])
-    segs = ['IDX_I'] if row['segment'] == 'IDX_I' else [seg_memory.get('stock', 'NSE_FNO'),
-                                                         'NSE_EQ' if seg_memory.get('stock', 'NSE_FNO') == 'NSE_FNO' else 'NSE_FNO']
+    segs = ['IDX_I'] if row['segment'] == 'IDX_I' else ['NSE_EQ', 'NSE_FNO']
     err, expiries, seg_used = '', None, None
     for seg in segs:
         try:
@@ -680,7 +679,7 @@ def option_for_setup(api, row, p, seg_memory):
         'Contract': f"{sym} {exp.strftime('%d%b%Y').upper()} {strike:g} {side}", 'Strike': strike, 'Where': pick['where'],
         'Entry premium (ask)': round(premium, 2), 'LTP': round(float(pick.ltp), 2), 'Bid': pick.bid, 'Ask': pick.ask,
         'Spread %': round(float(pick['spread %']), 2), 'Delta': round(delta, 3), 'IV %': round(float(pick.iv), 1) if pick.iv == pick.iv else None,
-        'OI': pick.oi, 'Volume': pick.volume, 'Lot size': lot if lot == lot else None, 'Lots': lots,
+        'OI': pick.oi, 'Volume': pick.volume, 'Theta': pick.theta, 'Gamma': pick.gamma, 'Vega': pick.vega, 'Lot size': lot if lot == lot else None, 'Lots': lots,
         'Outlay Rs': round(outlay), 'Max loss Rs (SL)': round(maxloss),
         'Premium SL': round(premium * (1 - p['sl_frac']), 2), 'Premium T1 (1R)': round(premium * (1 + p['sl_frac']), 2),
         'Premium T2 (2R)': round(premium * (1 + 2 * p['sl_frac']), 2),
@@ -1336,7 +1335,7 @@ def main():
             if ss.options:
                 st.subheader('Proposed option contracts')
                 cols = ['Symbol', 'Side', 'Verdict', 'Contract', 'Expiry', 'Days left', 'Where', 'Entry premium (ask)', 'LTP', 'Spread %',
-                        'Delta', 'IV %', 'OI', 'Volume', 'Lot size', 'Lots', 'Outlay Rs', 'Max loss Rs (SL)', 'Premium SL',
+                        'Delta', 'IV %', 'Theta', 'Gamma', 'Vega', 'OI', 'Volume', 'Lot size', 'Lots', 'Outlay Rs', 'Max loss Rs (SL)', 'Premium SL',
                         'Premium T1 (1R)', 'Premium T2 (2R)', 'Note']
                 od = pd.DataFrame([{k: v for k, v in o.items() if not k.startswith('_')} for o in ss.options.values()])
                 show(od[[c for c in cols if c in od.columns]])
@@ -1426,14 +1425,14 @@ def main():
                     ss.paper.loc[idx, ['stop_current', 't1_hit', 'days_held', 'last_update', 'last_underlying']] = \
                         [r['stop_current'], r['t1_hit'], r['days_held'], r['last_update'], round(r['last_underlying'], 2)]
                     prem0, qty = num(t.entry_premium), num(t.lots, 0) * num(t.lot_size, 0)
-                    cur = ltp if ltp == ltp else r.get('model_premium', np.nan)
+                    cur = ltp if ltp == ltp else np.nan
                     if prem0 == prem0:
                         ss.paper.loc[idx, ['last_premium', 'premium_source', 'unrealized_pnl']] = \
-                            [round(cur, 2), 'chain LTP' if ltp == ltp else 'model (delta estimate)', round((cur - prem0) * qty, 2)]
+                            [round(cur, 2), 'Dhan chain LTP' if ltp == ltp else 'unavailable', round((cur - prem0) * qty, 2)]
+                    # Historical underlying OHLC must never be used to invent an option fill.
+                    # Snapshot-based exits are handled by auto_paper_cycle on SCAN NOW.
                     if r['exit']:
-                        e = r['exit']
-                        close_row(ss.paper, idx, e['date'], e['px'], e['prem'], e['reason'], slip)
-                        msgs.append(f"{t.symbol}: CLOSED - {e['reason']}")
+                        msgs.append(f'{t.symbol}: underlying exit condition observed; no historical option fill assumed')
                 except Exception as e:
                     msgs.append(f'{t.symbol}: update failed - {str(e)[:120]}')
             persist()
@@ -1452,43 +1451,66 @@ def main():
             row = eligible[eligible.Symbol == sym].iloc[0]
             o = ss.options.get(sym) or {}
             st.write(f"{row.Status} · {row.Side} · score {row.Score} · underlying entry {row.Close} · SL {row['Underlying SL']} · T1 {row['Target 1 (1R)']} · T2 {row['Target 2 (2R)']}")
-            if o.get('Contract'): st.write(f"Option: **{o['Contract']}** (verdict {o['Verdict']})")
-            else: st.caption('No option contract fetched for this setup - select it in tab 2, or type premium/lot manually (0 = underlying-only paper trade).')
-            e1, e2, e3, e4 = st.columns(4)
-            prem = e1.number_input('Entry premium', 0.0, 100000.0, float(o.get('Entry premium (ask)') or 0.0), 0.05, key=f'pp_{sym}')
-            lot = e2.number_input('Lot size', 0, 100000, int(o.get('Lot size') or num(row.get('Lot size'), 0)), key=f'pl_{sym}')
-            auto_lots = size_position(capital, risk_pct, prem, lot, sl_frac, max_exposure)[0] if prem > 0 and lot > 0 else 0
-            lots = e3.number_input('Lots', min_value=0, max_value=max(1000, int(auto_lots)), value=max(0, min(1000, int(auto_lots))), key=f'pn_{sym}')
-            strike = e4.number_input('Strike', 0.0, 1000000.0, float(o.get('Strike') or 0.0), key=f'ps_{sym}')
-            exp_txt = st.text_input('Expiry (YYYY-MM-DD)', o.get('Expiry', ''), key=f'pe_{sym}')
-            if st.button('Record paper entry'):
-                new_exp = prem * lot * lots
-                bad = entry_guard(ss.paper, sym, row.Side, new_exp, capital, int(max_open), max_exposure, weekly_limit)
-                if prem > 0 and (lot <= 0 or lots <= 0): bad.append('Option trade needs lot size and lots >= 1 (or set premium 0 for underlying-only)')
+            st.caption('Only Dhan-validated option contracts can enter the premium paper journal. No manual or estimated premium fills.')
+            if st.button('Fetch / refresh Dhan option contract', key=f'fetch_paper_{sym}', disabled=not (token and client_id)):
+                with st.spinner(f'Fetching expiry, option chain and premium for {sym}…'):
+                    ss.options[sym] = option_for_setup(DhanAPI(token, client_id), row.to_dict(), opt_params, ss.seg_memory)
+                st.rerun()
+            o = ss.options.get(sym) or {}
+            if o.get('Contract'):
+                st.write(f"**{o['Contract']}** · {o.get('Where', '')} · verdict **{o['Verdict']}**")
+                info = st.columns(5)
+                for col, (label, key) in zip(info, [('Expiry','Expiry'),('Ask premium','Entry premium (ask)'),('Delta','Delta'),('IV %','IV %'),('Lot size','Lot size')]):
+                    col.metric(label, str(o.get(key, '—')))
+                st.caption(f"Spread {o.get('Spread %','—')}% · OI {o.get('OI','—')} · volume {o.get('Volume','—')} · theta {o.get('Theta','—')} · {o.get('Note','')}")
+            else:
+                st.warning('Option contract not yet fetched from Dhan. Click Fetch / refresh above.')
+            if o.get('Verdict') != 'TRADE':
+                st.warning('No paper option entry until the contract, expiry, bid/ask, Greeks, liquidity and affordable lots are validated. '+str(o.get('Note','')))
+            if st.button('Record Dhan-priced paper entry', disabled=o.get('Verdict') != 'TRADE', key=f'record_paper_{sym}'):
+                # Fetch again on entry: never use a stale quote from an earlier scan.
+                fresh = option_for_setup(DhanAPI(token, client_id), row.to_dict(), opt_params, ss.seg_memory)
+                ss.options[sym] = fresh
+                prem = num(fresh.get('Entry premium (ask)'))
+                lot = int(num(fresh.get('Lot size'), 0))
+                lots = int(num(fresh.get('Lots'), 0))
+                exp = pd.to_datetime(fresh.get('Expiry'), errors='coerce')
+                bad = entry_guard(ss.paper, sym, row.Side, prem*lot*lots, capital, int(max_open), max_exposure, weekly_limit)
+                if fresh.get('Verdict') != 'TRADE' or not np.isfinite(prem) or prem <= 0 or lot < 1 or lots < 1 or pd.isna(exp):
+                    bad.append('Dhan option contract / expiry / ask / lot validation failed')
+                if pd.notna(exp) and (exp.date() - datetime.now(IST).date()).days < min_days:
+                    bad.append('Too close to expiry')
                 if bad:
-                    for b in bad: st.error(b)
+                    for message in bad: st.error(message)
                 else:
-                    opt = prem > 0
                     rec = {c: np.nan for c in JOURNAL_COLS}
-                    rec.update({'id': datetime.now(IST).strftime('%Y%m%d%H%M%S%f'), 'opened_at': datetime.now(IST).isoformat(timespec='seconds'),
-                                'signal_date': row.Date, 'symbol': sym, 'side': row.Side, 'status': 'OPEN', 'setup': row.Status, 'score': row.Score,
-                                'underlying_entry': row.Close, 'underlying_sl': row['Underlying SL'], 'underlying_t1': row['Target 1 (1R)'],
-                                'underlying_t2': row['Target 2 (2R)'], 'sid': row.sid, 'segment': row.segment, 'instrument': row.instrument,
-                                'stop_current': row['Underlying SL'], 't1_hit': False, 'days_held': 0, 'sl_frac': sl_frac,
-                                'notes': 'Option premium paper trade' if opt else 'Underlying-only paper trade'})
-                    if opt:
-                        d_val = num(o.get('Delta'), 0.55 * (1 if row.Side == 'CE' else -1))
-                        rec.update({'contract': o.get('Contract', f'{sym} {exp_txt} {strike:g} {row.Side}'), 'expiry': exp_txt or np.nan,
-                                    'strike': strike or np.nan, 'lot_size': lot, 'lots': lots, 'entry_premium': prem, 'entry_delta': d_val,
-                                    'entry_iv': o.get('IV %', np.nan), 'chain_sid': o.get('chain_sid', row.sid), 'chain_seg': o.get('chain_seg', ''),
-                                    'last_premium': prem, 'premium_source': 'entry', 'unrealized_pnl': 0.0})
+                    rec.update({'id':datetime.now(IST).strftime('%Y%m%d%H%M%S%f'),
+                                'opened_at':datetime.now(IST).isoformat(timespec='seconds'),
+                                'signal_date':row.Date, 'symbol':sym, 'side':row.Side, 'status':'OPEN',
+                                'setup':row.Status, 'score':row.Score, 'underlying_entry':row.Close,
+                                'underlying_sl':row['Underlying SL'], 'underlying_t1':row['Target 1 (1R)'],
+                                'underlying_t2':row['Target 2 (2R)'], 'contract':fresh['Contract'],
+                                'expiry':fresh['Expiry'], 'strike':fresh['Strike'], 'lot_size':lot,
+                                'lots':lots, 'entry_premium':prem, 'entry_delta':fresh.get('Delta'),
+                                'entry_iv':fresh.get('IV %'), 'sl_frac':sl_frac, 'sid':row.sid,
+                                'segment':row.segment, 'instrument':row.instrument,
+                                'chain_sid':fresh['chain_sid'], 'chain_seg':fresh['chain_seg'],
+                                'stop_current':row['Underlying SL'], 't1_hit':False, 'days_held':0,
+                                'last_premium':prem, 'premium_source':'Dhan ASK snapshot (paper assumption)',
+                                'unrealized_pnl':0.0,
+                                'notes':'Dhan option quote at record time; simulated entry, not broker fill'})
                     ss.paper = pd.concat([ss.paper, pd.DataFrame([rec])], ignore_index=True)
                     persist()
-                    st.success('Paper entry recorded.')
+                    st.success(f"Recorded simulated entry: {fresh['Contract']} @ Rs {prem:.2f} x {lot*lots} units")
+                    st.rerun()
 
         # ---- tables
         jr = ss.paper
         st.markdown('#### Open trades')
+        legacy = jr[(jr.status == 'OPEN') & (pd.to_numeric(jr.entry_premium, errors='coerce').isna() | jr.contract.isna() | jr.expiry.isna())]
+        if not legacy.empty:
+            st.warning(f'{len(legacy)} existing open record(s) have no verified option contract/premium. They are UNDERLYING-ONLY records. Current Dhan quotes cannot reconstruct their historical entry price; close or delete them manually and create new Dhan-priced paper trades.')
+        st.caption('Premiums are snapshot quotes, not actual broker fills. Quotes update only when you scan or click Update; this is not continuous monitoring.')
         show(jr[jr.status == 'OPEN'].drop(columns=['sid', 'segment', 'instrument', 'chain_sid', 'chain_seg', 'sl_frac'], errors='ignore'))
         res = journal_stats(jr)
         st.markdown('#### Closed trades & statistics')
@@ -1497,7 +1519,7 @@ def main():
             show(pd.DataFrame([stats]))
             st.line_chart(eq.reset_index(drop=True), height=200)
         show(jr[jr.status == 'CLOSED'].drop(columns=['sid', 'segment', 'instrument', 'chain_sid', 'chain_seg', 'sl_frac'], errors='ignore'))
-        st.caption('Premium P&L for model exits is a first-order delta estimate (no theta/IV change) with approximate Zerodha costs and the slippage % from the sidebar. Treat it as optimistic.')
+        st.caption('Premium journal uses Dhan quote snapshots. Simulated fills, not actual executions; costs and slippage are estimates. Never interpret modeled or missing prices as realized premium P&L.')
 
         # ---- manual close / delete
         if not jr.empty:
