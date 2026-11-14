@@ -1286,30 +1286,27 @@ def main():
             m5.metric('Bullish / Bearish month', f"{int((s['Monthly trend'] == 'BULLISH').sum())} / {int((s['Monthly trend'] == 'BEARISH').sum())}")
             show(s.drop(columns=HIDE, errors='ignore'))
             st.download_button('Download scanner CSV', s.drop(columns=HIDE, errors='ignore').to_csv(index=False).encode(), 'dhan_scan.csv')
-        else:
-            st.info('Press SCAN NOW. All F&O stocks + indices are scanned in parallel (about 1-2 minutes first time; repeat scans use the 6h cache).')
-
             # Visual market overview (only scanned symbols; not whole-market breadth)
             st.subheader('Scan overview')
             c1, c2 = st.columns(2)
             with c1:
                 st.caption('Signal classification')
-                if not all_df.empty and 'Status' in all_df.columns:
-    status_counts = (
-        all_df['Status']
-        .fillna('Unknown')
-        .value_counts()
-        .rename('Setups')
-    )
-    st.bar_chart(status_counts)
-else:
-    st.info("No scanner results available yet.")
+                if 'Status' in s.columns:
+                    status_counts = s['Status'].fillna('Unknown').value_counts().rename('Setups')
+                    st.bar_chart(status_counts)
+                else:
+                    st.info('Status data unavailable.')
             with c2:
                 st.caption('CE vs PE signals')
-                st.bar_chart(s['Side'].value_counts().rename('Setups'))
-            if 'Score' in s:
+                if 'Side' in s.columns:
+                    st.bar_chart(s['Side'].fillna('Unknown').value_counts().rename('Setups'))
+                else:
+                    st.info('Side data unavailable.')
+            if 'Score' in s.columns:
                 st.caption('Technical scores · count of scanned setups')
                 st.bar_chart(s['Score'].value_counts().sort_index().rename('Setups'))
+        else:
+            st.info('Press SCAN NOW to scan the F&O universe. Cached candles may speed up repeat scans.')
 
     # ============================ TAB 2 ============================
     with t2:
