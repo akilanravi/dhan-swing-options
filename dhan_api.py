@@ -17,7 +17,7 @@ class DhanAPI:
     def post(self, path, payload):
         for attempt in range(3):
             try:
-                r = self.session.post(BASE + path, json=payload, timeout=35)
+                r = self.session.post(BASE + path, json=payload, timeout=18)
                 if r.status_code == 429 and attempt < 2:
                     time.sleep(2 ** attempt * 3)
                     continue
@@ -56,7 +56,7 @@ class DhanAPI:
                 d.index = pd.to_datetime(out['timestamp'], unit='s', utc=True).tz_convert('Asia/Kolkata').tz_localize(None)
                 frames.append(d)
             cur = nxt
-            time.sleep(.12)
+            time.sleep(.15)
         if not frames: raise ValueError('No candles returned; check instrument mapping, access and date range')
         d = pd.concat(frames).sort_index()
         d = d[~d.index.duplicated(keep='last')]
@@ -135,6 +135,7 @@ def build_universe(master):
     result = equity[['symbol','sid','segment','instrument']].dropna()
     result = result[result['sid'].str.fullmatch(r'\d+')].drop_duplicates('symbol')
     result = result[~result['symbol'].str.contains(r'TEST|DUMMY|MOCK', case=False, na=False)].sort_values('symbol').reset_index(drop=True)
+    result = result[result['symbol'].str.fullmatch(r'[A-Z0-9&._-]{2,40}', na=False)].reset_index(drop=True)
     if result.empty:
         raise ValueError(f'Found {len(keys)} F&O symbols but no matching NSE equity IDs. Sample F&O symbols: {sorted(keys)[:8]}')
     return result

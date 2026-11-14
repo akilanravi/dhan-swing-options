@@ -71,7 +71,7 @@ def score(row,side,volume_available=True):
 
 def annotate(d,cfg,ticker):
     d=d.copy(); d['prev_adx']=d.adx.shift(1)
-    # Yahoo index volume is often 0: index signals cannot pass volume confirmation.
+    # Index spot volume can be unavailable: never treat missing volume as confirmation.
     validvol=(d.Volume>0)&(d.vol20>0)
     events=set(cfg.get('event_blackout_dates',{}).get(ticker,[]))
     signals=[]; scores=[]
@@ -90,3 +90,25 @@ def annotate(d,cfg,ticker):
     d['score']=scores; d['signal']=signals
     return d
 
+
+
+def rejection_reasons(r, side, cfg, ticker='', volume_available=True):
+    """Explain every failed mandatory gate without changing the entry rules."""
+    bull = side == 'CE'
+    reasons = []
+    def check(condition, label):
+        if not bool(condition): reasons.append(label)
+    check(pd.notna(r.ema200) and ((r.Close > r.ema200) if bull else (r.Close < r.ema200)), 'EMA200 trend')
+    check(r.st_dir == (1 if bull else -1), 'Supertrend direction')
+    check(pd.notna(r.adx) and r.adx > 22, 'ADX <= 22')
+    check(pd.notna(r.prev_adx) and r.adx > r.prev_adx, 'ADX not rising')
+    check((r.pdi > r.mdi) if bull else (r.mdi > r.pdi), 'DI direction')
+    check(bool(r.cross_up or r.break_up) if bull else bool(r.cross_down or r.break_down), 'No fresh EMA cross / weekly breakout')
+    check((r.rsi > 55) if bull else (r.rsi < 45), 'RSI momentum')
+    check(volume_available and r.Volume > r.vol20, 'Volume not confirmed')
+    check(pd.notna(r.cpr_width) and r.cpr_width <= cfg['max_weekly_cpr_width'], 'Weekly CPR too wide / unavailable')
+    check(pd.notna(r.adx) and r.adx >= 20, 'ADX below 20')
+    check(score(r, side) >= cfg['min_score'], 'Score below threshold')
+    dates = cfg.get('event_blackout_dates', {}).get(ticker, [])
+    # Date-based event filter is checked by the caller when dates are configured.
+    return list(dict.fromkeys(reasons))

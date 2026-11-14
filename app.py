@@ -1,12 +1,13 @@
 import os
 from datetime import date, timedelta
+import time
 import pandas as pd
 import streamlit as st
 from dhan_api import DhanAPI, read_instrument_master, build_universe
-from signals import indicators, annotate, score
+from signals import indicators, annotate, score, rejection_reasons
 
 st.set_page_config(page_title='Dhan Swing Options V3', page_icon='📊', layout='wide')
-st.title('Dhan Swing Options V3.1 | F&O Scanner + Paper Trading')
+st.title('Dhan Swing Options V3.4 | F&O Scanner + Paper Trading')
 st.caption('Dhan API only · Manual execution · No Telegram · No Yahoo · No automatic orders')
 
 try:
@@ -38,6 +39,7 @@ if 'paper' not in st.session_state:
     st.session_state.paper = pd.DataFrame(columns=['id','opened_at','symbol','side','reference_entry','reference_stop','reference_target1','reference_target2','score','status','closed_at','reference_exit','underlying_points','notes'])
 if 'master' not in st.session_state: st.session_state.master = None
 if 'universe' not in st.session_state: st.session_state.universe = pd.DataFrame()
+if 'scan_errors' not in st.session_state: st.session_state.scan_errors = pd.DataFrame()
 
 config = {'min_score': min_score, 'max_weekly_cpr_width': cpr_width,
           'event_blackout_dates': {}}
@@ -59,7 +61,10 @@ t1,t2,t3,t4 = st.tabs(['1 · Market scanner','2 · Top CE/PE setups','3 · Trade
 with t1:
     st.subheader('Automatically load current NSE F&O universe')
     st.caption('Automatically downloads the current Dhan instrument master. No file upload needed.')
-    if st.button('Load Dhan instrument master', type='primary'):
+    if st.button('Refresh Dhan instrument master', type='secondary'):
+        cached_master.clear()
+        st.session_state.universe = pd.DataFrame()
+    if st.session_state.universe.empty:
         try:
             with st.spinner('Loading instrument master…'):
                 master = cached_master()
@@ -75,6 +80,7 @@ with t1:
         st.dataframe(u.head(25), use_container_width=True, hide_index=True)
     st.info('First scan downloads historical candles (approximately 5 requests per stock); repeat scans reuse cached candles for 6 hours. Dhan API limits still apply. Scan in batches.')
     offset = st.number_input('Start at stock number', 1, 1000, 1, 10)
+    st.caption('Stock numbering starts at 1. The universe is loaded automatically.')
     if st.button('Scan selected batch', disabled=not token, type='primary'):
         api = DhanAPI(token, client_id=client_id)
         today = date.today()
@@ -85,9 +91,11 @@ with t1:
         if not stocks: st.warning('Load instrument master first, or enable indices.')
         else:
             results=[]; history=[]; errors=[]
+            started = time.monotonic()
             progress = st.progress(0, text='Starting scan')
             for i, x in enumerate(stocks):
                 try:
+                    stock_started = time.monotonic()
                     # ~350 calendar days for EMA200 warm-up, 85-day bounded Dhan requests.
                     daily = cached_daily(token, client_id, x['sid'], x['segment'], x['instrument'], today.isoformat())
                     if len(daily) < 220: raise ValueError(f'Only {len(daily)} candles (need 220+)')
@@ -105,13 +113,15 @@ with t1:
                     direction = 1 if side == 'CE' else -1
                     entry = float(r.Close)
                     risk = float(r.atr) * 1.5
+                    reasons = rejection_reasons(r, side, cfg, x['symbol'], volok)
                     row = {'Symbol':x['symbol'],'Date':d.index[-1].strftime('%Y-%m-%d'),
                            'Side':side,'Score':int(best),'Eligible':eligible,'Close':entry,
                            'Underlying SL':entry-direction*risk,'Target 1 (1R)':entry+direction*risk,
                            'Target 2 (2R)':entry+direction*2*risk,
                            'ADX':float(r.adx),'RSI':float(r.rsi),'Volume OK':volok,
                            'Weekly CPR width %':float(r.cpr_width)*100 if pd.notna(r.cpr_width) else None,
-                           'Reason': 'Eligible daily signal' if eligible else ('Missing index/stock volume' if not volok else 'Mandatory filter or trigger not met')}
+                           'Reason': 'Eligible daily signal' if eligible else '; '.join(reasons),
+                           'Failed gates':len(reasons), 'Load seconds':round(time.monotonic()-stock_started,2)}
                     results.append(row)
                     for dt, s in d.tail(scan_days).iterrows():
                         if s.signal:
@@ -125,9 +135,12 @@ with t1:
                 st.session_state.scan = pd.concat([prior[~prior.Symbol.isin(new.Symbol)],new],ignore_index=True) if not prior.empty else new
                 st.session_state.scan = st.session_state.scan.sort_values(['Eligible','Score','ADX'],ascending=[False,False,False]).reset_index(drop=True)
                 st.session_state.history = pd.concat([st.session_state.history,pd.DataFrame(history)],ignore_index=True).drop_duplicates(['Symbol','Date','Side']) if history else st.session_state.history
-                st.success(f'Scanned {len(results)} instruments; {int(new.Eligible.sum())} eligible. Results from previous batches retained in this session.')
+                st.success(f'Scanned {len(results)} instruments in {time.monotonic()-started:.1f}s; {int(new.Eligible.sum())} eligible. Previous batches retained in this session.')
+            st.session_state.scan_errors = pd.DataFrame(errors)
             if errors: st.warning(f'{len(errors)} instruments failed'); st.dataframe(pd.DataFrame(errors),hide_index=True)
+            if errors: st.download_button('Download API errors CSV',pd.DataFrame(errors).to_csv(index=False),file_name='dhan_api_errors.csv')
     if not st.session_state.scan.empty:
+        st.caption('Only the latest completed daily candle is eligible for a new entry; prior signals are historical.')
         st.subheader('Latest batch results — eligible first')
         st.dataframe(st.session_state.scan, use_container_width=True, hide_index=True)
         st.download_button('Download scanner CSV',st.session_state.scan.to_csv(index=False).encode(),file_name='dhan_scan.csv')
