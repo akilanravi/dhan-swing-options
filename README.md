@@ -1,23 +1,22 @@
-# Dhan Swing Options Research Website
+# Dhan Swing Options V3
 
-No Yahoo Finance, Telegram, broker orders, or scheduled jobs.
+Streamlit research dashboard with Dhan-only F&O universe scanning, score-ranked CE/PE signals and a session-based paper journal.
 
-## Run locally
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-Open the local URL shown by Streamlit. Enter your Dhan access token in the password field. For deployment, set `DHAN_ACCESS_TOKEN` as an environment variable or Streamlit secret. Never commit a real token.
+## Deploy
+Upload `app.py`, `dhan_api.py`, `signals.py`, `requirements.txt` to the root of your existing GitHub repository (replace old files). Streamlit Cloud entrypoint: `app.py`. Add `DHAN_ACCESS_TOKEN = "..."` in Streamlit Cloud Secrets (never commit secrets).
 
-## Data
-Uses Dhan v2 `/charts/historical`, `/charts/intraday` (60-minute), `/optionchain/expirylist`, and `/optionchain` APIs. Access depends on Dhan API permissions. Verify security IDs with Dhan's current instrument master. This code makes no order requests.
+## Usage
+1. Load the Dhan detailed instrument master. If the download fails, upload a current CSV from Dhan.
+2. Check the matched F&O stock universe. Run a small batch of 10–30 first, then use the Start at stock number offset for subsequent batches.
+3. Top CE/PE tab shows valid current daily signals, sorted by score and ADX. Scan history shows older triggers separately.
+4. Use Paper Trading to record simulated underlying reference entries and exits; export CSV frequently and re-import after restarts.
 
-## Important limitations
-- No actual historical option P&L or historical option premium backtest.
-- Underlying-only daily CE/PE research signals; option chain is raw inspection.
-- 60-minute candles are displayed, not automatically integrated into signal trigger.
-- Index volume may be zero, blocking volume-confirmed signals.
-- Weekly CPR and indicator rules are research approximations; validate on historical data.
-- Results and corporate-event blackout dates must be supplied manually.
-- Position sizing, portfolio exposure/correlation, expiry checks, option delta/IV percentile and full walk-forward testing are pending.
-- Market close is not a guaranteed executable entry price.
+## Critical limitations
+- No verified live API test has been performed; Dhan's instrument-master schema may require adaptation.
+- Index spot volume can be absent: index signals remain ineligible under the strict volume rule.
+- Data fetch is on demand and bounded by Dhan rate limits. It does not continuously scan every F&O stock.
+- Events require manual blackout dates. No automatic earnings calendar.
+- No option strike/premium, lot-size, expiry selection, IV percentile, Greeks, bid-ask, or historical option premium P&L is simulated or invented.
+- The paper journal uses underlying price points only, not actual option returns. Session state is ephemeral on Streamlit Cloud.
+- Index IDs 13 and 25 are starting mappings and must be verified against Dhan master.
+- No automated orders or brokerage charges; not a production-ready live execution system.
