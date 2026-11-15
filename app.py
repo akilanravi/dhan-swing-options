@@ -69,20 +69,27 @@ def num(x, default=np.nan) -> float:
         return default
 
 
+CANDLE_COLORS = {'Bullish': '#34f5ae', 'Bearish': '#ff688b', 'Neutral': '#ffe082'}
+CANDLE_LEGEND = '🟢 Bullish: Close > Open · 🔴 Bearish: Close < Open · 🟡 Neutral: Close = Open'
+
+def candle_direction(open_price, close_price):
+    op = pd.to_numeric(open_price, errors='coerce')
+    cl = pd.to_numeric(close_price, errors='coerce')
+    if pd.isna(op) or pd.isna(cl):
+        return 'Unavailable'
+    return 'Bullish' if cl > op else 'Bearish' if cl < op else 'Neutral'
+
+
 def show(df, **kw):
-    """Dark-readable tables; candle rows use the requested Open > Close green rule."""
+    """Dark-readable tables with the same candle colors as the chart."""
     kw.setdefault('hide_index', True)
     display = df
     if isinstance(df, pd.DataFrame) and not df.empty:
         if {'Open', 'Close'}.issubset(df.columns):
             def candle_colors(r):
-                op, cl = pd.to_numeric(r['Open'], errors='coerce'), pd.to_numeric(r['Close'], errors='coerce')
-                if pd.isna(op) or pd.isna(cl):
-                    return [''] * len(r)
-                # Requested mapping: Open > Close GREEN; Open < Close RED.
-                col = '#34f5ae' if op > cl else '#ff688b' if op < cl else '#e9f3ff'
-                return [f'color: {col}; background-color: #102033' for _ in r]
-            display = df.style.apply(candle_colors, axis=1).set_table_styles([
+                col = CANDLE_COLORS.get(candle_direction(r['Open'], r['Close']))
+                return [f'color: {col}; background-color: #102033' if col else ''] * len(r)
+            display = df.style.apply(candle_colors, axis=1).format(precision=2).set_table_styles([
                 {'selector': 'th', 'props': [('background-color', '#14243a'), ('color', '#eaf4ff')]},
                 {'selector': 'td', 'props': [('border-color', '#283e59')]},
             ])
@@ -1024,24 +1031,28 @@ def candle_chart(df):
         return
     source = df.reset_index().rename(columns={df.index.name or 'index': 'Date'}).copy()
     source['Date'] = pd.to_datetime(source['Date'])
-    source['Direction'] = np.where(source['Close'] >= source['Open'], 'Bullish', 'Bearish')
+    source['Direction'] = [candle_direction(op, cl) for op, cl in zip(source['Open'], source['Close'])]
     x = alt.X('Date:T', title='Trading date', axis=alt.Axis(format='%d %b', labelColor='#c6d7f0', titleColor='#c6d7f0'))
     y = alt.Y('Low:Q', title='Price (₹)', scale=alt.Scale(zero=False), axis=alt.Axis(labelColor='#c6d7f0', titleColor='#c6d7f0'))
-    color = alt.Color('Direction:N', scale=alt.Scale(domain=['Bullish', 'Bearish'], range=['#27e5ac', '#ff608c']), legend=None)
+    color = alt.Color('Direction:N', scale=alt.Scale(domain=list(CANDLE_COLORS), range=list(CANDLE_COLORS.values())), legend=None)
     tooltip = [alt.Tooltip('Date:T', format='%d %b %Y'), alt.Tooltip('Open:Q', format=',.2f'),
                alt.Tooltip('High:Q', format=',.2f'), alt.Tooltip('Low:Q', format=',.2f'),
-               alt.Tooltip('Close:Q', format=',.2f'), alt.Tooltip('Volume:Q', format=',.0f')]
+               alt.Tooltip('Close:Q', format=',.2f'), alt.Tooltip('Volume:Q', format=',.0f'),
+               alt.Tooltip('Direction:N', title='Candle direction')]
     base = alt.Chart(source).encode(x=x, color=color, tooltip=tooltip)
     wicks = base.mark_rule(strokeWidth=1.5).encode(y=y, y2='High:Q')
     bodies = base.mark_bar(size=6).encode(y=alt.Y('Open:Q', scale=alt.Scale(zero=False)), y2='Close:Q')
-    layers = [wicks, bodies]
+    flat = base.transform_filter(alt.datum.Direction == 'Neutral').mark_tick(
+        orient='horizontal', size=9, thickness=2, opacity=1,
+    ).encode(y=alt.Y('Close:Q', scale=alt.Scale(zero=False)))
+    layers = [wicks, bodies, flat]
     for period, line_color in [(9, '#facc15'), (21, '#69b9ff'), (50, '#ff9f70'), (200, '#c5a0ff')]:
         field = f'ema{period}'
         if field in source:
             layers.append(alt.Chart(source.dropna(subset=[field])).mark_line(color=line_color, strokeWidth=1.6).encode(x=x, y=alt.Y(f'{field}:Q', scale=alt.Scale(zero=False)), tooltip=[alt.Tooltip('Date:T'), alt.Tooltip(f'{field}:Q', format=',.2f')]))
     chart = alt.layer(*layers).resolve_scale(y='shared').properties(height=430, background='#0b1424').configure_view(stroke=None)
     st.altair_chart(chart, use_container_width=True)
-    st.caption('Green = Close ≥ Open · Red = Close < Open · EMA9 yellow · EMA21 blue · EMA50 orange · EMA200 purple')
+    st.caption(CANDLE_LEGEND + ' · EMA9 yellow · EMA21 blue · EMA50 orange · EMA200 purple')
 
 
 
@@ -1403,8 +1414,8 @@ def main():
                     daily = load_daily(DhanAPI(token, client_id), cache, x, last_complete_session())
                     d = indicators(daily).tail(120)
                     candle_chart(d)
-                    st.caption('Candle table colors (as requested): 🟢 Open > Close · 🔴 Open < Close · ⚪ Equal')
-                    show(d.tail(10)[['Open', 'High', 'Low', 'Close', 'Volume', 'ema9', 'ema21', 'adx', 'rsi', 'st_dir', 'cpr_width']].round(2).reset_index(), hide_index=True)
+                    st.caption('Candle table · ' + CANDLE_LEGEND)
+                    show(d.tail(10)[['Open', 'High', 'Low', 'Close', 'Volume', 'ema9', 'ema21', 'adx', 'rsi', 'st_dir', 'cpr_width']].reset_index(), hide_index=True)
                 except Exception as e:
                     st.error(f'Chart unavailable: {e}')
             st.warning('Underlying SL/targets are reference levels, not option prices. Use tab 2 for the option contract.')
@@ -1614,5 +1625,5 @@ def main():
             else:
                 st.caption('No high-score watchlist setups in the current scan.')
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
