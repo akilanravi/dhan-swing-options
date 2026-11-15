@@ -37,6 +37,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import altair as alt
+from decision_panel import show_panel, load_quote, context
 
 IST = ZoneInfo('Asia/Kolkata')
 BASE = 'https://api.dhan.co/v2'
@@ -144,6 +145,29 @@ class DhanAPI:
                                      'Accept': 'application/json'})
 
     def post(self, path, payload, limiter=DATA_LIMITER, with_client=False):
+        # Optional cross-process pacing when both workers share a Dhan account on Linux.
+        lock_dir=os.environ.get('DHAN_SHARED_LIMIT_DIR')
+        if not lock_dir:return self._post(path,payload,limiter,with_client)
+        import fcntl
+        from pathlib import Path
+        root=Path(lock_dir)
+        root.mkdir(parents=True,exist_ok=True)
+        is_chain=path in ('/optionchain','/optionchain/expirylist')
+        with (root/('chain.lock' if is_chain else 'data.lock')).open('a+') as handle:
+            fcntl.flock(handle,fcntl.LOCK_EX)
+            handle.seek(0)
+            prior=float(handle.read() or '0')
+            pause=(3.25 if is_chain else .25)
+            time.sleep(max(0, min(pause, prior+pause-time.time())))
+            try:
+                return self._post(path,payload,limiter,with_client)
+            finally:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(str(time.time()))
+                handle.flush()
+
+    def _post(self, path, payload, limiter=DATA_LIMITER, with_client=False):
         headers = {'client-id': self.client_id} if (with_client and self.client_id) else {}
         last = ''
         for attempt in range(4):
@@ -582,6 +606,8 @@ def parse_chain(resp):
             g = leg.get('greeks') or {}
             rows.append({'strike': strike, 'type': typ.upper(), 'ltp': num(leg.get('last_price')),
                          'bid': num(leg.get('top_bid_price')), 'ask': num(leg.get('top_ask_price')),
+                         'bid_qty': num(leg.get('top_bid_quantity')), 'ask_qty': num(leg.get('top_ask_quantity')),
+                         'previous_oi': num(leg.get('previous_oi')), 'security_id': leg.get('security_id'),
                          'delta': num(g.get('delta')), 'theta': num(g.get('theta')), 'gamma': num(g.get('gamma')), 'vega': num(g.get('vega')), 'iv': num(leg.get('implied_volatility')),
                          'oi': num(leg.get('oi')), 'volume': num(leg.get('volume'))})
     return spot, pd.DataFrame(rows)
@@ -1067,7 +1093,10 @@ def main():
         try: return os.getenv(name) or st.secrets.get(name, '')
         except Exception: return os.getenv(name, '')
 
+    from worker_store import cloud_journal, enabled
+    worker_mode=enabled(secret('PAPER_WORKER_MODE'))
     with st.sidebar:
+        if worker_mode:st.info('Paper trading is managed by the external worker. Sidebar settings apply to dashboard scans only.')
         st.header('Dhan connection')
         token = st.text_input('Access token', value=secret('DHAN_ACCESS_TOKEN'), type='password')
         client_id = st.text_input('Client ID', value=secret('DHAN_CLIENT_ID'))
@@ -1144,7 +1173,7 @@ def main():
     ss.setdefault('actions', [])
     journal = JournalStore(secret('GITHUB_TOKEN'), secret('PAPER_GIST_ID'))
     if 'paper' not in ss:
-        ss.paper, ss.paper_msg = journal.load()
+        ss.paper, ss.paper_msg = (normalize_journal(None), '') if worker_mode else journal.load()
         ss.gist_id = journal.gist_id
     journal.gist_id = ss.get('gist_id', journal.gist_id)
 
@@ -1153,7 +1182,7 @@ def main():
         ss.gist_id = journal.gist_id
 
     cache = get_cache()
-    t1, t2, t3, t4, t5 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards'])
+    t1, t2, t3, t4, t5, t6 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards','6 · Trade Decision'])
 
     def auto_paper_cycle(api, candidates=None):
         """Run only on explicit SCAN NOW; no broker orders and no modeled option fills."""
@@ -1313,7 +1342,7 @@ def main():
                 ss.options = {}
                 store[skey] = {'scan': ss.scan, 'history': ss.history}
                 st.success(f'Scanned {len(results)} instruments in {time.monotonic() - t0:.0f}s ({len(errors)} failed).')
-            if results and (auto_paper or auto_exit):
+            if not worker_mode and results and (auto_paper or auto_exit):
                 for message in auto_paper_cycle(api, ss.scan):
                     st.info(message)
             ss.scan_errors = pd.DataFrame(errors)
@@ -1436,7 +1465,18 @@ def main():
             st.caption('Indicator values are from the most recent completed daily candle.')
 
     # ============================ TAB 4 ============================
+    worker_journal_ok=False
     with t4:
+        if worker_mode:
+            st.button('Reload worker journal', key='worker_reload')
+            try:
+                frame,heartbeat=cloud_journal(secret('GITHUB_TOKEN'),secret('PAPER_GIST_ID'),'swing').read()
+                ss.paper=normalize_journal(frame)
+                worker_journal_ok=True
+                st.caption(f"Worker owns paper trading · Last worker check: {heartbeat.get('checked_at','not reported')} · {heartbeat.get('state','waiting')}")
+                if heartbeat.get('notes'):st.caption(heartbeat['notes'][-1])
+            except Exception as e:
+                st.error(f'Cannot read worker journal: {e}')
         st.subheader('Paper trading journal (option premium based)')
         mode = journal.mode
         st.caption(f"Storage: {'GitHub Gist (persistent)' if mode == 'gist' else 'local file (lost when Streamlit Cloud reboots - add GITHUB_TOKEN)'} · {ss.get('paper_msg', '')}")
@@ -1452,7 +1492,7 @@ def main():
 
         # ---- update open trades
         if st.button('Update open trades (apply SL / targets / trail / time / signal exits)', type='primary',
-                     disabled=openr.empty or not token):
+                     disabled=worker_mode or openr.empty or not token):
             api = DhanAPI(token, client_id)
             cutoff = last_complete_session()
             live = live_premiums(api, ss.paper) if (client_id and st.session_state.get('use_live', True)) else {}
@@ -1512,7 +1552,7 @@ def main():
                 st.warning('Option contract not yet fetched from Dhan. Click Fetch / refresh above.')
             if o.get('Verdict') != 'TRADE':
                 st.warning('No paper option entry until the contract, expiry, bid/ask, Greeks, liquidity and affordable lots are validated. '+str(o.get('Note','')))
-            if st.button('Record Dhan-priced paper entry', disabled=o.get('Verdict') != 'TRADE', key=f'record_paper_{sym}'):
+            if st.button('Record Dhan-priced paper entry', disabled=worker_mode or o.get('Verdict') != 'TRADE', key=f'record_paper_{sym}'):
                 # Fetch again on entry: never use a stale quote from an earlier scan.
                 fresh = option_for_setup(DhanAPI(token, client_id), row.to_dict(), opt_params, ss.seg_memory)
                 ss.options[sym] = fresh
@@ -1574,17 +1614,17 @@ def main():
                 xu = m1.number_input('Exit underlying price', 0.0, 10000000.0, 0.0, key='mc_u')
                 xp = m2.number_input('Exit premium (0 = unknown)', 0.0, 100000.0, 0.0, 0.05, key='mc_p')
                 b1, b2 = st.columns(2)
-                if b1.button('Close this trade manually'):
+                if b1.button('Close this trade manually', disabled=worker_mode):
                     idx = ss.paper.index[ss.paper.id.astype(str) == tid][0]
                     if ss.paper.loc[idx, 'status'] == 'OPEN' and xu > 0:
                         close_row(ss.paper, idx, datetime.now(IST).date().isoformat(), xu, xp if xp > 0 else np.nan, 'MANUAL EXIT', slip)
                         persist(); st.success('Closed.')
                     else: st.error('Trade already closed, or exit price missing.')
-                if b2.button('Delete this trade'):
+                if b2.button('Delete this trade', disabled=worker_mode):
                     ss.paper = ss.paper[ss.paper.id.astype(str) != tid].reset_index(drop=True)
                     persist(); st.success('Deleted.')
         up = st.file_uploader('Restore journal CSV', type='csv', key='paper_up')
-        if up and st.button('Import journal CSV'):
+        if up and st.button('Import journal CSV', disabled=worker_mode):
             try:
                 ss.paper = normalize_journal(pd.read_csv(up)); persist(); st.success('Imported.')
             except Exception as e: st.error(str(e))
@@ -1624,6 +1664,65 @@ def main():
                 show(watch.sort_values('Score', ascending=False).drop(columns=HIDE, errors='ignore'))
             else:
                 st.caption('No high-score watchlist setups in the current scan.')
+
+    with t6:
+        st.subheader('Swing trade decision')
+        if ss.scan.empty:
+            st.info('Run a Market Scanner scan first.')
+        else:
+            sym=st.selectbox('Decision symbol', sorted(ss.scan.Symbol.unique()),key='idea_s_symbol')
+            row=ss.scan[ss.scan.Symbol.eq(sym)].iloc[0]
+            idea=dict(symbol=sym,side=row.Side,mode='swing',eligible=bool(row.Eligible),
+                      reason=f"{row.Status} · {row.Score}/10 · {row.get('Hard blocks','') or 'No scanner hard blocks'}",
+                      candle=str(row.Date),close=row.Close,sid=row.sid,segment=row.segment,
+                      instrument=row.instrument,lot=row.get('Lot size'),account=skey)
+            gap=st.number_input('Opening-gap review limit (%)',min_value=0.1,max_value=10.,value=1.,step=.1,
+                                help='A panel-only threshold. This does not change the strategy.')
+            now=datetime.now(IST)
+            reviewed=st.checkbox('I checked upcoming results and major events for this symbol',key=f'decision_results_review_{sym}_{now.date()}')
+            known_events=[pd.to_datetime(x,errors='coerce') for x in blackouts]
+            has_event=any(pd.notna(x) and abs((x.date()-now.date()).days)<=3 for x in known_events)
+            invalid_event=any(pd.isna(x) for x in known_events)
+            checks=[('Results / scheduled events',None if invalid_event else False if has_event else True if reviewed else None,
+                     'Event within ±3 days' if has_event else 'Invalid blackout date' if invalid_event else
+                     'Manual review noted' if reviewed else 'No automatic earnings calendar. Confirm manually.')]
+            policy=dict(capital=capital,cap=max_trade_rupees,risk=risk_pct,stop=sl_frac,target_r=2,slip=slip/100,
+                delta_lo=d_lo,delta_hi=d_hi,spread=max_spread,min_days=int(min_days),exposure=max_exposure,
+                max_open=int(max_open),weekly_limit=weekly_limit,max_gap=gap,has_connection=bool(token and client_id),
+                journal_ok=bool(worker_journal_ok if worker_mode else not str(ss.get('paper_msg','')).startswith('Load failed')),
+                start=(9,30) if worker_mode else (9,15),end=(10,30) if worker_mode else (15,30),
+                window='09:30–10:30 IST (Linux worker)' if worker_mode else '09:15–15:30 IST (panel review, not a scheduled fill)',
+                worker_mode=worker_mode)
+            def inspect_swing(p):
+                api=DhanAPI(token,client_id)
+                notes=['A 60-minute EMA trend is context, not a crossover trigger. At the open, wait for a completed current-session bar.']
+                if str(row.segment)!='IDX_I':
+                    notes.append('Stock option: check physical-settlement obligations before expiry.')
+                work=dict(p)
+                try:
+                    cutoff=datetime.now(IST).date()-timedelta(days=1)
+                    ref=load_daily(api,cache,dict(sid='13',segment='IDX_I',instrument='INDEX'),cutoff)
+                    latest=ref.index[-1].date()
+                    work['daily_verified']=str(latest)==idea['candle'] and 0<(datetime.now(IST).date()-latest).days<=4
+                    refgate=('Latest completed daily session',work['daily_verified'],f'NIFTY reference: {latest}; setup: {idea["candle"]}.')
+                except Exception as exc:
+                    work['daily_verified']=False
+                    refgate=('Latest completed daily session',None,'Daily session check unavailable · '+str(exc)[:130])
+                try:gates,_=context(api,idea,work)
+                except Exception as exc:gates=[('60-minute EMA trend',None,'No verified timeframe data · '+str(exc)[:130]),
+                                                ('Opening gap',None,'Opening candle check unavailable')]
+                gates.insert(0,refgate)
+                def expiry(dates,today):return pick_monthly_expiry(dates,p['min_days'],today)[0]
+                try:return load_quote(api,idea,p,expiry,parse_chain,select_contract),None,gates,notes
+                except Exception as exc:return None,str(exc)[:230],gates,notes
+            st.caption('One-lot review using the dashboard risk settings. It does not authorize a worker entry or certify an existing multi-lot plan.')
+            st.write(f"**Underlying references:** Close ₹{row.Close:,.2f} · ATR stop ₹{row['Underlying SL']:,.2f} · 2R target ₹{row['Target 2 (2R)']:,.2f}")
+            st.caption('Calendar events and the 60-minute review here do not change the existing automated rules.')
+            show_panel(idea,policy,ss.paper,inspect_swing,key='preflight_swing',base_checks=checks,
+                       critical_context=['Latest completed daily session','60-minute EMA trend','Opening gap'],
+                       exit_rules=['Automatic: premium stop, 2R premium target, expiry window or 10 calendar days.',
+                                   'The Linux worker checks Dhan bid snapshots; Scan Now automation checks LTP snapshots.',
+                                   'Underlying ATR, trailing and EMA reversal are not automatic exits in this worker.'])
 
 if __name__ == "__main__":
     main()
