@@ -1183,7 +1183,7 @@ def main():
         ss.gist_id = journal.gist_id
 
     cache = get_cache()
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards','6 · Trade Decision','7 · Underlying Backtest'])
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards','6 · Trade Decision','7 · Call / Put Backtest'])
 
     def auto_paper_cycle(api, candidates=None):
         """Run only on explicit SCAN NOW; no broker orders and no modeled option fills."""
