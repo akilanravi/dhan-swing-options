@@ -1614,4 +1614,5 @@ def main():
             else:
                 st.caption('No high-score watchlist setups in the current scan.')
 
-main()
+if __name__ == '__main__':
+    main()
