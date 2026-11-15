@@ -182,6 +182,8 @@ def load_quote(api,idea,policy,choose_expiry,parse_chain,select_contract):
 
 def show_panel(idea, policy, journal, fetch, *, key, base_checks=(), exit_rules=(), critical_context=()):
     import streamlit as st
+    from institutional_flows import show_flows
+    show_flows(idea['symbol'],key+'_flows',idea.get('segment')=='IDX_I')
     st.caption('Read-only, one-lot preflight. This does not place orders, open paper trades or change worker settings.')
     policy=dict(policy)
     base_checks=list(base_checks)
