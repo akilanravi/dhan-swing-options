@@ -1,1 +1,39 @@
-
+name: Independent Swing Paper Scanner
+on:
+  workflow_dispatch:
+    inputs:
+      worker_mode:
+        description: "auto = scan + exits after close; exit = check paper exits only"
+        type: choice
+        options: [auto, exit]
+        default: auto
+  schedule:
+    - cron: '0 7 * * 1-5'    # 12:30 PM IST: exit checks
+    - cron: '45 10 * * 1-5'  # 4:15 PM IST: fresh daily close + entries/exits
+permissions:
+  contents: read
+concurrency:
+  group: swing-paper-journal
+  cancel-in-progress: false
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+      DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+      GITHUB_TOKEN: ${{ secrets.PAPER_GIST_TOKEN }}
+      PAPER_GIST_ID: ${{ secrets.PAPER_GIST_ID }}
+      PAPER_CAPITAL: '100000'
+      RISK_PCT: '1.0'
+      MAX_PREMIUM_PER_TRADE: '35000'
+      MIN_DAYS_TO_EXPIRY: '15'
+      WORKER_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.worker_mode || 'auto' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - run: python swing_worker.py
