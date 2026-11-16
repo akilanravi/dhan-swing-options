@@ -52,15 +52,36 @@ GIST_FILE = 'paper_trades.csv'
 # =====================================================================================
 # 0. small helpers
 # =====================================================================================
-def last_complete_session() -> date:
-    """Latest date whose daily candle is complete (NSE closes 15:30 IST; 15:45 gives buffer)."""
-    n = datetime.now(IST)
+# NSE equities full-day closures in 2026 (regular sessions). For future
+# calendars or exceptional closures, set NSE_CLOSED_DATES to ISO dates.
+NSE_CLOSED_2026 = frozenset(
+    '2026-01-15 2026-01-26 2026-03-03 2026-03-26 2026-03-31 '
+    '2026-04-03 2026-04-14 2026-05-01 2026-05-28 2026-06-26 '
+    '2026-09-14 2026-10-02 2026-10-20 2026-11-10 2026-11-24 2026-12-25'.split()
+)
+
+
+def regular_session(day):
+    extra = {item.strip() for item in os.getenv('NSE_CLOSED_DATES', '').split(',')}
+    return day.weekday() < 5 and day.isoformat() not in (NSE_CLOSED_2026 | extra)
+
+
+def last_complete_session(now=None) -> date:
+    """Expected completed session, not evidence of candle delivery by Dhan."""
+    n = datetime.now(IST) if now is None else now.astimezone(IST)
     d = n.date()
-    if n.weekday() >= 5:
-        return d - timedelta(days=n.weekday() - 4)
     if (n.hour, n.minute) < (15, 45):
         d -= timedelta(days=1)
-    return d - timedelta(days=(d.weekday() - 4) % 7) if d.weekday() >= 5 else d
+    while not regular_session(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def next_regular_session(day):
+    d = day + timedelta(days=1)
+    while not regular_session(d):
+        d += timedelta(days=1)
+    return d
 
 
 def num(x, default=np.nan) -> float:
@@ -253,15 +274,24 @@ def get_scan_store():
     return {}
 
 
-def load_daily(api, cache, x, cutoff, force=False):
+class MissingSessionCandle(ValueError):
+    def __init__(self, expected, actual):
+        self.expected, self.actual = expected, actual
+        super().__init__(f'Expected {expected}, Dhan candles available through {actual or "none"}')
+
+
+def load_daily(api, cache, x, cutoff, force=False, *, require_session=False):
     key = (x['sid'], x['segment'], x['instrument'], cutoff.isoformat())
     if not force:
         hit = cache.get(key)
-        if hit is not None:
+        if hit is not None and not hit.empty and hit.index[-1].date() == cutoff:
             return hit
     end = pd.Timestamp(cutoff) + timedelta(days=1)
     df = api.daily(x['sid'], x['segment'], x['instrument'], end - timedelta(days=420), end)
-    df = df[df.index.date <= cutoff]
+    df = df[df.index.date <= cutoff].sort_index()
+    actual = df.index[-1].date() if not df.empty else None
+    if require_session and actual != cutoff:
+        raise MissingSessionCandle(cutoff, actual)
     # Index spot candles carry no volume -> use near-month index-futures volume as proxy (flagged in output).
     if x['instrument'] == 'INDEX' and df.Volume.tail(25).sum() <= 0 and str(x.get('fut_sid', '')).isdigit():
         try:
@@ -271,7 +301,8 @@ def load_daily(api, cache, x, cutoff, force=False):
             df.attrs['vol_src'] = 'index futures proxy'
         except Exception:
             pass
-    cache.put(key, df)
+    if actual == cutoff:
+        cache.put(key, df)
     return df
 
 
@@ -520,7 +551,8 @@ def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0):
     entry, risk = float(r.Close), float(r.atr) * 1.5
     direction = 1 if bull else -1
 
-    mr = d[d.index.to_period('M') == d.index[-1].to_period('M')]
+    month_start = d.index[-1].normalize().replace(day=1)
+    mr = d.loc[month_start:]
     month_open = float(mr.iloc[0].Open)
     mtd = (entry / month_open - 1) * 100 if month_open > 0 else np.nan
     trig_mask = (mr.cross_up | mr.break_up) if bull else (mr.cross_down | mr.break_down)
@@ -565,6 +597,7 @@ def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0):
         'Symbol': sym, 'Date': d.index[-1].strftime('%Y-%m-%d'), 'Side': side, 'Score': best,
         'Status': status, 'Eligible': status in ('FRESH ENTRY', 'MONTH SETUP'),
         'Monthly trend': monthly_trend, 'MTD %': round(mtd, 2), 'Month trigger': last_trigger,
+        'Month first candle': mr.index[0].date().isoformat(),
         'Close': round(entry, 2), 'Underlying SL': round(entry - direction * risk, 2),
         'Target 1 (1R)': round(entry + direction * risk, 2), 'Target 2 (2R)': round(entry + direction * 2 * risk, 2),
         'ADX': round(float(r.adx), 1), 'RSI': round(float(r.rsi), 1),
@@ -1044,6 +1077,7 @@ def eligible_card(row):
     return f"""<div class="signal-card {cls}">
       <div class="signal-name">{name} <span class="signal-pill">{safe(side)}</span></div>
       <div class="signal-sub">{status} · Monthly trend: {trend}</div>
+      <div class="signal-sub">Candle checked: {safe(row.get('Date', '—'))} · Trigger: {safe(row.get('Month trigger') or '—')}</div>
       <div class="signal-score">{score}<span style="font-size:.85rem;color:#9bb0ca"> / 10</span></div>
       <div class="signal-levels">Underlying entry: <b>{price(entry)}</b><br>
       Underlying SL: <b class="signal-bad">{price(stop)}</b><br>
@@ -1159,15 +1193,16 @@ def main():
 
     # ---- session state
     ss = st.session_state
-    if ss.get('schema') != 'v4':          # stale session data from an older version of the app -> start clean
-        for k in ('scan', 'history', 'options', 'scan_errors', 'paper', 'paper_msg', 'universe', 'master'):
-            ss.pop(k, None)
-        ss['schema'] = 'v4'
+    expected = last_complete_session()
     store = get_scan_store()
     skey = hashlib.sha256((token or 'none').encode()).hexdigest()[:12]
-    if 'scan' not in ss:
-        saved = store.get(skey, {})
+    scan_key = ('mtd-v1', skey, expected.isoformat())
+    if ss.get('scan_key') != scan_key:
+        saved = store.get(scan_key, {})
         ss.scan, ss.history = saved.get('scan', pd.DataFrame()), saved.get('history', pd.DataFrame())
+        ss.scan_errors = saved.get('errors', pd.DataFrame())
+        ss.options = {}
+        ss.scan_key = scan_key
     ss.setdefault('options', {})
     ss.setdefault('scan_errors', pd.DataFrame())
     ss.setdefault('seg_memory', {})
@@ -1280,7 +1315,10 @@ def main():
             st.error(f'Universe load failed: {e}')
         c1, c2, c3, c4 = st.columns(4)
         c1.metric('F&O stocks found', len(stocks)); c2.metric('Indices', len(indices))
-        c3.metric('Last complete session', last_complete_session().isoformat())
+        c3.metric('Expected candle (IST)', expected.isoformat())
+        st.caption(f'Month-to-date trigger window: {expected:%B %Y} through {expected:%d %b}. '
+                   f'Watchlist for the next regular session: {next_regular_session(expected):%d %b %Y}. '
+                   'Only stocks with a verified candle for the expected date are evaluated.')
         if c4.button('Refresh instrument master'):
             load_universe.clear(); st.rerun()
         with st.expander('Universe preview'):
@@ -1293,7 +1331,7 @@ def main():
         workers = 4
         if st.button('SCAN NOW', type='primary', disabled=not (token and len(stocks))):
             api = DhanAPI(token, client_id)
-            cutoff = last_complete_session()
+            cutoff = expected
             pool = stocks if (scan_all or only) else stocks.head(int(n_limit))
             targets = pool.to_dict('records')
             if only:
@@ -1308,7 +1346,7 @@ def main():
 
             def job(x):
                 s = time.monotonic()
-                return load_daily(api, cache, x, cutoff), time.monotonic() - s
+                return load_daily(api, cache, x, cutoff, require_session=True), time.monotonic() - s
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = {ex.submit(job, x): x for x in targets}
                 for f in as_completed(futs):
@@ -1318,9 +1356,15 @@ def main():
                         c = dict(cfg); c['event_blackout_dates'] = {x['symbol']: blackouts}
                         row, h = analyze_instrument(x, daily, c, fii, dii, secs)
                         results.append(row); hist += h
+                    except MissingSessionCandle as e:
+                        errors.append({'Symbol': x['symbol'], 'Status': 'STALE / MISSING CANDLE',
+                                       'Expected date': cutoff.isoformat(),
+                                       'Dhan candle date': e.actual.isoformat() if e.actual else '',
+                                       'Error': str(e)})
                     except Exception as e:
                         msg = str(e)
-                        errors.append({'Symbol': x['symbol'], 'Error': msg})
+                        errors.append({'Symbol': x['symbol'], 'Status': 'SCAN FAILED',
+                                       'Expected date': cutoff.isoformat(), 'Dhan candle date': '', 'Error': msg})
                         if '401' in msg or 'DH-901' in msg or 'DH-902' in msg or 'Invalid_Authentication' in msg:
                             auth_fail += 1
                     done += 1
@@ -1331,26 +1375,37 @@ def main():
             prog.empty()
             if auth_fail >= 5 and not results:
                 st.error('Dhan rejected the token (401/DH-901). Generate a fresh access token and update Streamlit Secrets / the sidebar.')
-            if results:
-                df = pd.DataFrame(results)
-                prior = ss.scan
-                if not prior.empty and (only or not scan_all):
-                    df = pd.concat([prior[~prior.Symbol.isin(df.Symbol)], df], ignore_index=True)
+            df = pd.DataFrame(results)
+            if not df.empty:
                 df['_r'] = df.Status.map(STATUS_RANK)
                 df = df.sort_values(['_r', 'Score', 'ADX'], ascending=[True, False, False]).drop(columns='_r').reset_index(drop=True)
-                ss.scan = df
-                ss.history = pd.DataFrame(hist).drop_duplicates(['Symbol', 'Date', 'Side']) if hist else pd.DataFrame()
-                ss.options = {}
-                store[skey] = {'scan': ss.scan, 'history': ss.history}
-                st.success(f'Scanned {len(results)} instruments in {time.monotonic() - t0:.0f}s ({len(errors)} failed).')
-            if not worker_mode and results and (auto_paper or auto_exit):
-                for message in auto_paper_cycle(api, ss.scan):
-                    st.info(message)
+            # Each click replaces the scan, including a failed or symbol-only run.
+            # Old rows must never remain eligible after a failed recheck.
+            ss.scan = df
+            ss.history = pd.DataFrame(hist).drop_duplicates(['Symbol', 'Date', 'Side']) if hist else pd.DataFrame()
+            ss.options = {}
             ss.scan_errors = pd.DataFrame(errors)
+            store[scan_key] = {'scan': ss.scan, 'history': ss.history, 'errors': ss.scan_errors}
+            stale_count = sum(e['Status'] == 'STALE / MISSING CANDLE' for e in errors)
+            not_checked = len(targets) - done
+            summary = (f'{len(results)} of {len(targets)} verified for {cutoff} in '
+                       f'{time.monotonic() - t0:.0f}s · {stale_count} stale/missing · '
+                       f'{len(errors)-stale_count} failed · {not_checked} not checked')
+            if results and not errors and not not_checked:
+                st.success(summary)
+            elif results:
+                st.warning(summary)
+            elif targets:
+                st.warning(summary + ' · No verified watchlist. Retry once Dhan publishes the completed candles.')
+            else:
+                st.warning('No matching instruments. Check the symbol names and index filter.')
+            if not worker_mode and (auto_exit or (results and auto_paper)):
+                for message in auto_paper_cycle(api, ss.scan if results else None):
+                    st.info(message)
         if not ss.scan_errors.empty:
-            with st.expander(f'{len(ss.scan_errors)} instruments failed'):
+            with st.expander(f'{len(ss.scan_errors)} instruments excluded · candle date / error details', expanded=ss.scan.empty):
                 show(ss.scan_errors)
-                st.download_button('Download API errors CSV', ss.scan_errors.to_csv(index=False), 'dhan_api_errors.csv')
+                st.download_button('Download scan diagnostics CSV', ss.scan_errors.to_csv(index=False), 'dhan_scan_diagnostics.csv')
         if not ss.scan.empty:
             s = ss.scan
             m1, m2, m3, m4, m5 = st.columns(5)
@@ -1380,7 +1435,7 @@ def main():
                 st.caption('Technical scores · count of scanned setups')
                 st.bar_chart(s['Score'].value_counts().sort_index().rename('Setups'))
         else:
-            st.info('Press SCAN NOW to scan the F&O universe. Cached candles may speed up repeat scans.')
+            st.info('Press SCAN NOW to check Dhan for the expected completed session.')
 
     # ============================ TAB 2 ============================
     with t2:
@@ -1635,7 +1690,8 @@ def main():
     # ============================ TAB 5 ============================
     with t5:
         st.subheader('ELIGIBLE · CE / PE SIGNAL BOARD')
-        st.caption('Only confirmed eligible setups appear here. A score alone does not make a trade eligible. Data reflects the last completed scan, not live tick-by-tick prices.')
+        st.caption('Only confirmed eligible setups appear here. A score alone does not qualify. '
+                   'The candle date shows when conditions were checked and the trigger shows when the setup began.')
         s = ss.scan
         if s.empty:
             st.info('Run SCAN NOW on the Market scanner tab to populate these cards.')

@@ -17,7 +17,8 @@ import pandas as pd
 
 from app import (DhanAPI, JournalStore, JOURNAL_COLS, normalize_journal,
     load_universe, get_cache, load_daily, analyze_instrument, option_for_setup,
-    live_premiums, close_row, entry_guard, num, fetch_fii_dii_nse)
+    live_premiums, close_row, entry_guard, num, fetch_fii_dii_nse,
+    last_complete_session, next_regular_session, regular_session, MissingSessionCandle)
 
 IST = ZoneInfo('Asia/Kolkata')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -132,14 +133,11 @@ def run():
     candidates=[]
     if mode == 'live':
         saved = gist_watchlist(gist_token, gist_id)
-        if saved.get('created') != (now.date()-timedelta(days=1)).isoformat():
-            # For Mondays, accept Friday's watchlist; never accept a future date.
-            previous = now.date()-timedelta(days=1)
-            while previous.weekday() >= 5:
-                previous -= timedelta(days=1)
-            if saved.get('created') != previous.isoformat():
-                log.info('No watchlist from previous trading day; skipping new entries')
-                return
+        previous = last_complete_session(now)
+        if (saved.get('created') != previous.isoformat()
+                or next_regular_session(previous) != now.date()):
+            log.info('No watchlist from previous trading session; skipping new entries')
+            return
         candidates = saved.get('candidates', [])
         log.info('Live paper evaluation: %d saved candidates', len(candidates))
     else:
@@ -151,24 +149,35 @@ def run():
         fii, dii = (f.get('fii'), f.get('dii')) if 'error' not in f else (None, None)
         cache = get_cache()
         errors=[]
+        stale = 0
+        verified = 0
         cutoff = now.date()
+        if not regular_session(cutoff):
+            log.info('No regular NSE session today. No new watchlist.')
+            return
         for _, x in universe.iterrows():
             x = x.to_dict()
             try:
-                d = load_daily(api, cache, x, cutoff)
-                if d.empty or d.index[-1].date() != cutoff:
-                    continue
+                d = load_daily(api, cache, x, cutoff, require_session=True)
                 row, _ = analyze_instrument(x, d, cfg, fii, dii)
+                verified += 1
                 if row.get('Eligible'):
                     candidates.append(row)
+            except MissingSessionCandle as e:
+                stale += 1
+                errors.append((x.get('symbol'), str(e)))
             except Exception as e:
                 errors.append((x.get('symbol'), str(e)[:110]))
-        log.info('Daily scan: %d instruments, %d candidates, %d failures',len(universe),len(candidates),len(errors))
+        log.info('Daily scan: %d/%d verified for %s, %d candidates, %d stale/missing, %d failed',
+                 verified, len(universe), cutoff, len(candidates), stale, len(errors)-stale)
         for sym, err in errors[:10]: log.warning('%s: %s',sym,err)
+        if not verified:
+            raise RuntimeError(f'No verified candles for {cutoff}; watchlist was not updated')
         candidates.sort(key=lambda x:(-x['Score'],-x['ADX']))
         # Store JSON-safe values; never store option quotes as executable prices.
         safe = json.loads(json.dumps(candidates, default=str).replace('NaN', 'null'))
-        gist_watchlist(gist_token, gist_id, {'created': cutoff.isoformat(), 'candidates': safe})
+        gist_watchlist(gist_token, gist_id, {'created': cutoff.isoformat(), 'for_session': next_regular_session(cutoff).isoformat(),
+                                           'verified': verified, 'universe_size': len(universe), 'candidates': safe})
         log.info('Saved %d candidates for NEXT trading session. No after-hours paper entries.',len(safe))
         return
     # A saved daily setup is a candidate, NOT an execution signal. Intraday
