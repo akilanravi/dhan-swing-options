@@ -18,7 +18,7 @@ import pandas as pd
 from app import (DhanAPI, JournalStore, JOURNAL_COLS, normalize_journal,
     load_universe, get_cache, load_daily, analyze_instrument, option_for_setup,
     live_premiums, close_row, entry_guard, num, fetch_fii_dii_nse,
-    last_complete_session, next_regular_session, regular_session, MissingSessionCandle)
+    last_complete_session, next_regular_session, regular_session, MissingSessionCandle, scan_daily_sources)
 
 IST = ZoneInfo('Asia/Kolkata')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -155,19 +155,24 @@ def run():
         if not regular_session(cutoff):
             log.info('No regular NSE session today. No new watchlist.')
             return
-        for _, x in universe.iterrows():
-            x = x.to_dict()
+        targets = universe.to_dict('records')
+        ready, failed, yahoo_notes = scan_daily_sources(api, cache, targets, cutoff, now, log.info)
+        yahoo_count = 0
+        for x in targets:
+            sym = x['symbol']
             try:
-                d = load_daily(api, cache, x, cutoff, require_session=True)
-                row, _ = analyze_instrument(x, d, cfg, fii, dii)
+                if sym in failed:
+                    raise failed[sym]
+                d, elapsed = ready[sym]
+                row, _ = analyze_instrument(x, d, cfg, fii, dii, elapsed)
                 verified += 1
+                yahoo_count += row['Daily source'] == 'Yahoo Finance'
                 if row.get('Eligible'):
                     candidates.append(row)
-            except MissingSessionCandle as e:
-                stale += 1
-                errors.append((x.get('symbol'), str(e)))
             except Exception as e:
-                errors.append((x.get('symbol'), str(e)[:110]))
+                stale += isinstance(e, MissingSessionCandle)
+                errors.append((sym, f'{e} {yahoo_notes.get(sym, "")}'.strip()[:200]))
+        log.info('Daily sources: %d Dhan, %d Yahoo Finance', verified-yahoo_count, yahoo_count)
         log.info('Daily scan: %d/%d verified for %s, %d candidates, %d stale/missing, %d failed',
                  verified, len(universe), cutoff, len(candidates), stale, len(errors)-stale)
         for sym, err in errors[:10]: log.warning('%s: %s',sym,err)
@@ -177,7 +182,8 @@ def run():
         # Store JSON-safe values; never store option quotes as executable prices.
         safe = json.loads(json.dumps(candidates, default=str).replace('NaN', 'null'))
         gist_watchlist(gist_token, gist_id, {'created': cutoff.isoformat(), 'for_session': next_regular_session(cutoff).isoformat(),
-                                           'verified': verified, 'universe_size': len(universe), 'candidates': safe})
+                                           'verified': verified, 'dhan_count': verified-yahoo_count, 'yahoo_count': yahoo_count,
+                                           'universe_size': len(universe), 'candidates': safe})
         log.info('Saved %d candidates for NEXT trading session. No after-hours paper entries.',len(safe))
         return
     # A saved daily setup is a candidate, NOT an execution signal. Intraday

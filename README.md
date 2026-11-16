@@ -21,3 +21,43 @@ Use GitHub → Actions → Independent Swing Paper Scanner → Run workflow for 
 **Critical:** This is a scheduled paper research system, not a reliable live stop-loss service. It sees only Dhan snapshots when jobs run; stops/targets hit between snapshots can be missed, and prices can gap. A once/twice daily swing paper check is not equivalent to continuous monitoring. Refresh your Dhan token in BOTH Streamlit Secrets and swing GitHub Actions secrets after expiry. If the option chain or historical service is not entitled, worker logs will report errors.
 
 Python syntax checked; no live Dhan or Gist integration tested.
+
+## Month-to-date next-session scan
+
+After 15:45 IST on a regular trading day, the market scanner expects that
+session's completed daily candle. Before the cutoff it expects the previous
+regular session. The scheduled daily watchlist run remains at 16:15 IST.
+The app uses older bars as indicator warm-up (e.g. EMA 200), but only searches
+for qualifying EMA 9/21 and weekly CPR/R3 triggers inside the month of the
+verified candle. A same-month CE/PE trigger still needs to pass the existing
+setup gates and score requirements on the newest candle. No thresholds changed.
+
+The date on each result is the candle checked, not the trigger date. A valid
+earlier trigger in the same month can still qualify. A symbol that only returns
+an older candle goes into scan diagnostics and cannot become an eligible setup.
+Click SCAN NOW again to retry missing candles. An empty eligible list with
+verified candles means the conditions did not match. An unverified scan means
+the data is not ready or there was an API error.
+
+The app includes regular NSE equities closure dates for 2026. For future years
+or additional full-day closures, provide comma-separated ISO dates in the
+`NSE_CLOSED_DATES` environment variable.
+
+### Yahoo Finance fallback (Swing only)
+
+The dashboard and the scheduled next-session watchlist use Dhan daily candles
+when available. Outside regular market hours (15:45 IST onwards), the scanner
+can batch Yahoo Finance daily downloads for missing/mapped instruments. For a
+full-market scan, if sample Dhan symbols all return the same stale date, the app
+skips a full Dhan pass for mapped symbols, uses verified cached Dhan candles
+first, and retries Dhan for Yahoo misses. If either provider has no candle for
+the exact session date, its data cannot stand in for that date. Yahoo uses its
+own OHLCV history and may produce different indicator readings.
+
+NSE stocks use their NSE ticker with `.NS`. Among indices, Yahoo fallback
+is mapped to NIFTY and BANKNIFTY only, with no ETF or alternate-index substitution.
+An index with no reliable volume still fails the existing volume condition.
+Rows and signal cards show the source, and diagnostics indicate missing bars.
+Yahoo-sourced candidates stay out of dashboard automatic paper entries.
+Dhan still supplies the instrument list, option contracts, quotes and simulated
+fills. This does not change the Intraday project or the separate backtest.

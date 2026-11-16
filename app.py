@@ -2,7 +2,7 @@
 """
 Dhan Swing Options V4  |  single-file Streamlit app
 ---------------------------------------------------
-Dhan API only. No Yahoo, no Telegram, no automatic orders (analysis + paper trading).
+Dhan-first daily scanner with a Yahoo Finance after-close fallback. No broker orders.
 
 Contents
   1. Dhan API client (rate-limited, parallel-safe) + instrument master -> F&O universe
@@ -39,6 +39,7 @@ import streamlit as st
 import altair as alt
 from underlying_backtest import render_backtest
 from decision_panel import show_panel, load_quote, context
+from swing_data import yahoo_batch, yahoo_ticker
 
 IST = ZoneInfo('Asia/Kolkata')
 BASE = 'https://api.dhan.co/v2'
@@ -280,8 +281,12 @@ class MissingSessionCandle(ValueError):
         super().__init__(f'Expected {expected}, Dhan candles available through {actual or "none"}')
 
 
+def dhan_daily_key(x, cutoff):
+    return (x['sid'], x['segment'], x['instrument'], cutoff.isoformat())
+
+
 def load_daily(api, cache, x, cutoff, force=False, *, require_session=False):
-    key = (x['sid'], x['segment'], x['instrument'], cutoff.isoformat())
+    key = dhan_daily_key(x, cutoff)
     if not force:
         hit = cache.get(key)
         if hit is not None and not hit.empty and hit.index[-1].date() == cutoff:
@@ -301,9 +306,106 @@ def load_daily(api, cache, x, cutoff, force=False, *, require_session=False):
             df.attrs['vol_src'] = 'index futures proxy'
         except Exception:
             pass
+    df.attrs['candle_source'] = 'Dhan'
     if actual == cutoff:
         cache.put(key, df)
     return df
+
+
+def swing_after_close(now):
+    n = now.astimezone(IST)
+    return not regular_session(n.date()) or not (9, 15) <= (n.hour, n.minute) < (15, 45)
+
+
+def scan_daily_sources(api, cache, targets, cutoff, now, progress=None):
+    """Resolve daily bars for a watchlist, with a fast common-delay path."""
+    allow_yahoo = swing_after_close(now)
+    ready, failed, deferred = {}, {}, {}
+    remaining = {x['symbol']: x for x in targets}
+
+    def fetch(x):
+        if api is None:
+            raise ValueError('Dhan daily data unavailable: no access token')
+        t = time.monotonic()
+        return load_daily(api, cache, x, cutoff, require_session=True), time.monotonic() - t
+
+    def keep(x, result):
+        sym = x['symbol']
+        try:
+            ready[sym] = result()
+            failed.pop(sym, None)
+        except Exception as e:
+            failed[sym] = e
+
+    def dhan_many(items):
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            jobs = {ex.submit(fetch, x): x for x in items}
+            for i, f in enumerate(as_completed(jobs), 1):
+                x = jobs[f]
+                keep(x, f.result)
+                if progress:
+                    progress(f'Dhan daily check {i}/{len(jobs)} · {x["symbol"]}')
+
+    auth_error = None
+    if api is not None and allow_yahoo and len(targets) >= 12:
+        equities = [x for x in targets if x['segment'] == 'NSE_EQ']
+        probe = [x for x in targets if x['symbol'] == 'NIFTY'][:1]
+        probe += list({x['symbol']: x for x in equities[:1] + equities[-1:]}.values())
+        dhan_many(probe)
+        for x in probe:
+            remaining.pop(x['symbol'])
+        errors = [failed.get(x['symbol']) for x in probe]
+        lag = (len(probe) >= 2 and all(isinstance(e, MissingSessionCandle) for e in errors)
+               and len({e.actual for e in errors}) == 1)
+        auth = bool(errors) and all(any(code in str(e) for code in ('401', 'DH-901', 'DH-902', 'Invalid_Authentication'))
+                                    for e in errors if e is not None) and all(e is not None for e in errors)
+        if auth:
+            auth_error = errors[0]
+        if lag or auth:
+            # The sample shows a feed-wide delay or auth issue. Avoid a full
+            # serial-rate-limited Dhan pass, but retry Dhan for Yahoo misses.
+            for sym, x in list(remaining.items()):
+                cached = cache.get(dhan_daily_key(x, cutoff))
+                if cached is not None and not cached.empty and cached.index[-1].date() == cutoff:
+                    ready[sym] = cached, 0.0
+                    del remaining[sym]
+                elif yahoo_ticker(x):
+                    deferred[sym] = x
+                    del remaining[sym]
+
+    if api is not None and auth_error is None:
+        dhan_many(list(remaining.values()))
+    elif auth_error is not None:
+        failed.update({sym: auth_error for sym in remaining})
+    else:
+        for x in remaining.values():
+            keep(x, lambda: fetch(x))
+
+    yahoo_notes = {}
+    if allow_yahoo:
+        yahoo_targets = [x for x in targets if x['symbol'] not in ready and yahoo_ticker(x)]
+        if yahoo_targets:
+            if progress:
+                progress(f'Yahoo Finance fallback · {len(yahoo_targets)} symbols')
+            t = time.monotonic()
+            frames, notes = yahoo_batch(yahoo_targets, cutoff, cache)
+            elapsed = time.monotonic() - t
+            for x in yahoo_targets:
+                sym, ticker = x['symbol'], yahoo_ticker(x)
+                if ticker in frames:
+                    ready[sym] = frames[ticker], elapsed
+                    failed.pop(sym, None)
+                else:
+                    yahoo_notes[sym] = notes.get(ticker, 'Yahoo candle unavailable')
+            if api is not None and deferred and auth_error is None:
+                dhan_many([x for sym, x in deferred.items() if sym not in ready])
+            elif auth_error is not None:
+                failed.update({sym: auth_error for sym in deferred if sym not in ready})
+    for x in targets:
+        sym = x['symbol']
+        if sym not in ready and sym not in failed:
+            failed[sym] = ValueError('No daily candle from either provider')
+    return ready, failed, yahoo_notes
 
 
 # ---- instrument master -> F&O universe ------------------------------------------------
@@ -602,7 +704,8 @@ def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0):
         'Target 1 (1R)': round(entry + direction * risk, 2), 'Target 2 (2R)': round(entry + direction * 2 * risk, 2),
         'ADX': round(float(r.adx), 1), 'RSI': round(float(r.rsi), 1),
         'CPR width %': round(float(r.cpr_width) * 100, 2) if pd.notna(r.cpr_width) else None,
-        'Volume OK': volok, 'Volume source': daily.attrs.get('vol_src', 'spot/equity'),
+        'Daily source': daily.attrs.get('candle_source', 'Dhan'),
+        'Volume OK': volok, 'Volume source': daily.attrs.get('vol_src', 'spot/equity') if volavail else 'Unavailable',
         'Flow bias (market)': fbias, 'Hard blocks': '; '.join(dict.fromkeys(blocks)),
         'Today gates failed': '; '.join(reasons) if status != 'FRESH ENTRY' else '',
         'Lot size': x.get('lot'), 'Load sec': round(secs, 2),
@@ -1077,7 +1180,7 @@ def eligible_card(row):
     return f"""<div class="signal-card {cls}">
       <div class="signal-name">{name} <span class="signal-pill">{safe(side)}</span></div>
       <div class="signal-sub">{status} · Monthly trend: {trend}</div>
-      <div class="signal-sub">Candle checked: {safe(row.get('Date', '—'))} · Trigger: {safe(row.get('Month trigger') or '—')}</div>
+      <div class="signal-sub">Candle checked: {safe(row.get('Date', '—'))} · {safe(row.get('Daily source', 'Dhan'))} · Trigger: {safe(row.get('Month trigger') or '—')}</div>
       <div class="signal-score">{score}<span style="font-size:.85rem;color:#9bb0ca"> / 10</span></div>
       <div class="signal-levels">Underlying entry: <b>{price(entry)}</b><br>
       Underlying SL: <b class="signal-bad">{price(stop)}</b><br>
@@ -1122,7 +1225,7 @@ def main():
     st.set_page_config(page_title='Dhan Swing Options V3.8 Neon', page_icon='📊', layout='wide')
     apply_dark_theme()
     st.title('DHAN QUANT · SWING OPTIONS TERMINAL')
-    st.caption('Dhan API only · manual execution · no orders are ever sent · research tool, not advice, no guaranteed profit')
+    st.caption('Dhan daily prices + Yahoo after-close fallback · Dhan option quotes · manual execution · no orders are ever sent · research tool, not advice, no guaranteed profit')
 
     def secret(name):
         try: return os.getenv(name) or st.secrets.get(name, '')
@@ -1135,7 +1238,7 @@ def main():
         st.header('Dhan connection')
         token = st.text_input('Access token', value=secret('DHAN_ACCESS_TOKEN'), type='password')
         client_id = st.text_input('Client ID', value=secret('DHAN_CLIENT_ID'))
-        st.caption('Dhan access tokens expire (usually in 24h). If every instrument fails with 401 / DH-901, generate a new token.')
+        st.caption('Dhan access tokens expire (usually in 24h). If Dhan returns 401 / DH-901, generate a new token for Dhan prices and option quotes.')
         st.header('Risk')
         capital = st.number_input('Capital (Rs)', 10000, 100000000, 100000, 5000)
         risk_pct = st.slider('Risk per trade (%)', 1.0, 2.0, 1.0, 0.5)
@@ -1193,10 +1296,11 @@ def main():
 
     # ---- session state
     ss = st.session_state
-    expected = last_complete_session()
+    scan_now_ist = datetime.now(IST)
+    expected = last_complete_session(scan_now_ist)
     store = get_scan_store()
     skey = hashlib.sha256((token or 'none').encode()).hexdigest()[:12]
-    scan_key = ('mtd-v1', skey, expected.isoformat())
+    scan_key = ('mtd-yahoo-v1', skey, expected.isoformat())
     if ss.get('scan_key') != scan_key:
         saved = store.get(scan_key, {})
         ss.scan, ss.history = saved.get('scan', pd.DataFrame()), saved.get('history', pd.DataFrame())
@@ -1260,7 +1364,7 @@ def main():
             elif not client_id:
                 notes.append('Automatic entries disabled: DHAN_CLIENT_ID missing.')
             else:
-                eligible = candidates[candidates.Eligible].sort_values(['Score','ADX'], ascending=[False,False])
+                eligible = candidates[candidates.Eligible & candidates['Daily source'].eq('Dhan')].sort_values(['Score','ADX'], ascending=[False,False])
                 for _, row in eligible.iterrows():
                     sym = row['Symbol']
                     # Do not re-enter the same symbol/side/signal after closing it.
@@ -1318,7 +1422,7 @@ def main():
         c3.metric('Expected candle (IST)', expected.isoformat())
         st.caption(f'Month-to-date trigger window: {expected:%B %Y} through {expected:%d %b}. '
                    f'Watchlist for the next regular session: {next_regular_session(expected):%d %b %Y}. '
-                   'Only stocks with a verified candle for the expected date are evaluated.')
+                   'Dhan first. Yahoo fallback outside market hours. Both must supply the expected candle date.')
         if c4.button('Refresh instrument master'):
             load_universe.clear(); st.rerun()
         with st.expander('Universe preview'):
@@ -1329,8 +1433,8 @@ def main():
         only = cc3.text_input('Only these symbols (optional, comma separated)', '')
         inc_idx = st.checkbox('Include indices (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50)', True)
         workers = 4
-        if st.button('SCAN NOW', type='primary', disabled=not (token and len(stocks))):
-            api = DhanAPI(token, client_id)
+        if st.button('SCAN NOW', type='primary', disabled=not (len(stocks) and (token or swing_after_close(scan_now_ist)))):
+            api = DhanAPI(token, client_id) if token else None
             cutoff = expected
             pool = stocks if (scan_all or only) else stocks.head(int(n_limit))
             targets = pool.to_dict('records')
@@ -1342,39 +1446,28 @@ def main():
                 targets = indices.to_dict('records') + targets
             results, hist, errors = [], [], []
             prog = st.progress(0.0, text='Starting…')
-            t0, done, auth_fail = time.monotonic(), 0, 0
-
-            def job(x):
-                s = time.monotonic()
-                return load_daily(api, cache, x, cutoff, require_session=True), time.monotonic() - s
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(job, x): x for x in targets}
-                for f in as_completed(futs):
-                    x = futs[f]
-                    try:
-                        daily, secs = f.result()
-                        c = dict(cfg); c['event_blackout_dates'] = {x['symbol']: blackouts}
-                        row, h = analyze_instrument(x, daily, c, fii, dii, secs)
-                        results.append(row); hist += h
-                    except MissingSessionCandle as e:
-                        errors.append({'Symbol': x['symbol'], 'Status': 'STALE / MISSING CANDLE',
-                                       'Expected date': cutoff.isoformat(),
-                                       'Dhan candle date': e.actual.isoformat() if e.actual else '',
-                                       'Error': str(e)})
-                    except Exception as e:
-                        msg = str(e)
-                        errors.append({'Symbol': x['symbol'], 'Status': 'SCAN FAILED',
-                                       'Expected date': cutoff.isoformat(), 'Dhan candle date': '', 'Error': msg})
-                        if '401' in msg or 'DH-901' in msg or 'DH-902' in msg or 'Invalid_Authentication' in msg:
-                            auth_fail += 1
-                    done += 1
-                    prog.progress(done / len(targets), text=f'{done}/{len(targets)} · {x["symbol"]}')
-                    if auth_fail >= 5 and not results:
-                        for ff in futs: ff.cancel()
-                        break
+            t0 = time.monotonic()
+            ready, failed, yahoo_notes = scan_daily_sources(
+                api, cache, targets, cutoff, scan_now_ist,
+                progress=lambda msg: prog.progress(0.35, text=msg))
+            for i, x in enumerate(targets, 1):
+                sym = x['symbol']
+                try:
+                    if sym in failed:
+                        raise failed[sym]
+                    daily, secs = ready[sym]
+                    c = dict(cfg); c['event_blackout_dates'] = {sym: blackouts}
+                    row, h = analyze_instrument(x, daily, c, fii, dii, secs)
+                    results.append(row); hist += h
+                except Exception as e:
+                    stale = isinstance(e, MissingSessionCandle)
+                    errors.append({'Symbol': sym, 'Status': 'STALE / MISSING CANDLE' if stale else 'SCAN FAILED',
+                                   'Expected date': cutoff.isoformat(),
+                                   'Dhan candle date': e.actual.isoformat() if stale and e.actual else '',
+                                   'Yahoo status': yahoo_notes.get(sym, ''),
+                                   'Error': str(e)})
+                prog.progress(0.35 + 0.65 * i / len(targets), text=f'Checking setups · {i}/{len(targets)}')
             prog.empty()
-            if auth_fail >= 5 and not results:
-                st.error('Dhan rejected the token (401/DH-901). Generate a fresh access token and update Streamlit Secrets / the sidebar.')
             df = pd.DataFrame(results)
             if not df.empty:
                 df['_r'] = df.Status.map(STATUS_RANK)
@@ -1387,19 +1480,19 @@ def main():
             ss.scan_errors = pd.DataFrame(errors)
             store[scan_key] = {'scan': ss.scan, 'history': ss.history, 'errors': ss.scan_errors}
             stale_count = sum(e['Status'] == 'STALE / MISSING CANDLE' for e in errors)
-            not_checked = len(targets) - done
-            summary = (f'{len(results)} of {len(targets)} verified for {cutoff} in '
-                       f'{time.monotonic() - t0:.0f}s · {stale_count} stale/missing · '
-                       f'{len(errors)-stale_count} failed · {not_checked} not checked')
-            if results and not errors and not not_checked:
+            yahoo_count = sum(r['Daily source'] == 'Yahoo Finance' for r in results)
+            summary = (f'{len(results)} of {len(targets)} dated {cutoff} in '
+                       f'{time.monotonic() - t0:.0f}s · Dhan {len(results)-yahoo_count} · Yahoo {yahoo_count} · '
+                       f'{stale_count} stale/missing · {len(errors)-stale_count} failed')
+            if results and not errors:
                 st.success(summary)
             elif results:
                 st.warning(summary)
             elif targets:
-                st.warning(summary + ' · No verified watchlist. Retry once Dhan publishes the completed candles.')
+                st.warning(summary + ' · No verified watchlist. Neither available source supplied usable data for the expected date.')
             else:
                 st.warning('No matching instruments. Check the symbol names and index filter.')
-            if not worker_mode and (auto_exit or (results and auto_paper)):
+            if api is not None and not worker_mode and (auto_exit or (results and auto_paper)):
                 for message in auto_paper_cycle(api, ss.scan if results else None):
                     st.info(message)
         if not ss.scan_errors.empty:
@@ -1435,7 +1528,7 @@ def main():
                 st.caption('Technical scores · count of scanned setups')
                 st.bar_chart(s['Score'].value_counts().sort_index().rename('Setups'))
         else:
-            st.info('Press SCAN NOW to check Dhan for the expected completed session.')
+            st.info('Press SCAN NOW to check for the expected completed session.')
 
     # ============================ TAB 2 ============================
     with t2:
@@ -1490,13 +1583,20 @@ def main():
             row = s[s.Symbol == sym].iloc[0]
             show(pd.DataFrame([row.drop(labels=HIDE, errors='ignore')]))
             if row['Hard blocks']: st.warning('Hard blocks: ' + row['Hard blocks'])
-            if token:
+            if token or row.get('Daily source') == 'Yahoo Finance':
                 try:
                     x = {'symbol': sym, 'sid': row.sid, 'segment': row.segment, 'instrument': row.instrument}
                     if row.instrument == 'INDEX':
                         _, idf = load_universe()
                         x['fut_sid'] = str(idf.set_index('symbol').loc[sym, 'fut_sid'])
-                    daily = load_daily(DhanAPI(token, client_id), cache, x, last_complete_session())
+                    if row.get('Daily source') == 'Yahoo Finance':
+                        chart_date = date.fromisoformat(row['Date'])
+                        frames, _ = yahoo_batch([x], chart_date, cache) if swing_after_close(scan_now_ist) else ({}, {})
+                        daily = frames.get(yahoo_ticker(x))
+                        if daily is None:
+                            raise ValueError('Yahoo daily chart unavailable for the selected scan')
+                    else:
+                        daily = load_daily(DhanAPI(token, client_id), cache, x, expected, require_session=True)
                     d = indicators(daily).tail(120)
                     candle_chart(d)
                     st.caption('Candle table · ' + CANDLE_LEGEND)
@@ -1690,8 +1790,8 @@ def main():
     # ============================ TAB 5 ============================
     with t5:
         st.subheader('ELIGIBLE · CE / PE SIGNAL BOARD')
-        st.caption('Only confirmed eligible setups appear here. A score alone does not qualify. '
-                   'The candle date shows when conditions were checked and the trigger shows when the setup began.')
+        st.caption('Only setups that pass your rules appear here. Yahoo setups are for watchlist review, '
+                   'not automatic paper entries. The candle date and the original trigger date are shown separately.')
         s = ss.scan
         if s.empty:
             st.info('Run SCAN NOW on the Market scanner tab to populate these cards.')
