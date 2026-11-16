@@ -7,6 +7,8 @@ import os
 import sys
 import math
 import logging
+import json
+import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -41,6 +43,23 @@ def config():
 def clean_id(value):
     v = str(value).strip()
     return v[:-2] if v.endswith('.0') else v
+
+
+def gist_watchlist(token, gist_id, rows=None):
+    """Persist the daily candidate list in the same Gist as the journal."""
+    url = f'https://api.github.com/gists/{gist_id}'
+    headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+    if rows is not None:
+        payload = {'files': {'swing_next_day_watchlist.json': {'content': json.dumps(rows, default=str, allow_nan=False)}}}
+        resp = requests.patch(url, headers=headers, json=payload, timeout=25)
+        resp.raise_for_status()
+        return rows
+    resp = requests.get(url, headers=headers, timeout=25)
+    resp.raise_for_status()
+    item = resp.json().get('files', {}).get('swing_next_day_watchlist.json', {})
+    if item.get('truncated'):
+        raise RuntimeError('Watchlist Gist truncated')
+    return json.loads(item.get('content') or '{}')
 
 
 def run():
@@ -97,72 +116,67 @@ def run():
             raise RuntimeError(status)
 
     mode = os.getenv('WORKER_MODE', 'auto').lower()
-    # Entries are only evaluated after daily market close; no retroactive fills.
-    if mode == 'exit' or (now.hour,now.minute) < (15,45):
+    if mode not in ('auto', 'watchlist', 'live', 'exit'):
+        raise ValueError(f'Unknown WORKER_MODE: {mode}')
+    if mode == 'exit':
         log.info('Exit-only cycle complete')
         return
-    stocks, indices = load_universe()
-    universe = pd.concat([stocks,indices], ignore_index=True)
-    if universe.empty:
-        raise RuntimeError('Dhan F&O universe empty; no new paper trades')
-    # FII/DII may be unavailable. Unknown flow neither grants nor blocks a setup.
-    f = fetch_fii_dii_nse()
-    fii, dii = (f.get('fii'), f.get('dii')) if 'error' not in f else (None, None)
-    cache = get_cache()
-    candidates=[]; errors=[]
-    cutoff = now.date()
-    for i, x in universe.iterrows():
-        x = x.to_dict()
-        try:
-            d = load_daily(api, cache, x, cutoff)
-            if d.index[-1].date() != cutoff:
-                continue  # No fresh daily close; do not enter yesterday's signal.
-            row, _ = analyze_instrument(x, d, cfg, fii, dii)
-            if row.get('Eligible'):
-                candidates.append(row)
-        except Exception as e:
-            errors.append((x.get('symbol'), str(e)[:110]))
-    log.info('Scan: %d instruments, %d eligible candidates, %d failures',len(universe),len(candidates),len(errors))
-    for s,e in errors[:10]: log.warning('%s: %s',s,e)
-    candidates.sort(key=lambda x:(-x['Score'],-x['ADX']))
-    seg_mem={}
-    for row in candidates:
-        if len(journal[journal.status == 'OPEN']) >= 3:
-            break
-        sym, side = row['Symbol'], row['Side']
-        if not journal[(journal.symbol==sym)&(journal.side==side)&(journal.signal_date.astype(str)==str(row['Date']))].empty:
-            continue
-        try:
-            pick = option_for_setup(api, row, opt, seg_mem)
-            if pick.get('Verdict') != 'TRADE':
-                log.info('SKIP %s: %s', sym,pick.get('Note'))
-                continue
-            prem, lot, lots = num(pick.get('Entry premium (ask)')), int(num(pick.get('Lot size'),0)), int(num(pick.get('Lots'),0))
-            if not all([np.isfinite(prem),prem>0,lot>0,lots>0,num(pick.get('Ask'))>0]): continue
-            if (pd.Timestamp(pick['Expiry']).date()-now.date()).days < opt['min_days']: continue
-            reasons = entry_guard(journal,sym,side,prem*lot*lots,opt['capital'],3,opt['max_exposure'],4.0,opt['max_trade_rupees'])
-            if reasons:
-                log.info('SKIP %s: %s',sym,'; '.join(reasons)); continue
-            rec={c:np.nan for c in JOURNAL_COLS}
-            rec.update(dict(id=now.strftime('%Y%m%d%H%M%S%f')+'_'+sym,
-                opened_at=now.isoformat(),signal_date=str(row['Date']), symbol=sym,side=side,
-                status='OPEN',setup=row['Status'],score=row['Score'],underlying_entry=row['Close'],
-                underlying_sl=row['Underlying SL'],underlying_t1=row['Target 1 (1R)'],underlying_t2=row['Target 2 (2R)'],
-                contract=pick['Contract'],expiry=pick['Expiry'],strike=pick['Strike'],
-                lot_size=lot,lots=lots,entry_premium=prem,entry_delta=pick.get('Delta'),entry_iv=pick.get('IV %'),
-                sl_frac=opt['sl_frac'],sid=clean_id(row['sid']),segment=row['segment'],instrument=row['instrument'],
-                chain_sid=clean_id(pick['chain_sid']),chain_seg=pick['chain_seg'],
-                stop_current=row['Underlying SL'],t1_hit=False,days_held=0,last_premium=prem,
-                premium_source='Dhan ask snapshot (simulated)',unrealized_pnl=0.0,
-                notes='UNATTENDED PAPER ONLY; quote snapshot not an execution price'))
-            # Save each entry immediately for restart safety.
-            journal = pd.concat([journal,pd.DataFrame([rec])],ignore_index=True)
-            status = store.save(journal)
-            if not status.startswith('Saved to GitHub Gist'):
-                raise RuntimeError(status)
-            log.info('ENTRY %s %s %s x%d @ %.2f',sym,side,pick['Contract'],lots,prem)
-        except Exception as e:
-            log.exception('Option evaluation failed for %s: %s',sym,e)
+    # 3:45 PM IST watchlist is based on the COMPLETED daily candle.
+    # During live market hours only yesterday's watchlist is considered for paper entries.
+    if mode in ('auto', 'watchlist') and (now.hour, now.minute) < (15,45):
+        log.info('Waiting for completed daily candle (15:45 IST)')
+        return
+    if mode == 'live' and not ((9,30) <= (now.hour, now.minute) < (15,25)):
+        log.info('Outside live paper-entry window')
+        return
+    candidates=[]
+    if mode == 'live':
+        saved = gist_watchlist(gist_token, gist_id)
+        if saved.get('created') != (now.date()-timedelta(days=1)).isoformat():
+            # For Mondays, accept Friday's watchlist; never accept a future date.
+            previous = now.date()-timedelta(days=1)
+            while previous.weekday() >= 5:
+                previous -= timedelta(days=1)
+            if saved.get('created') != previous.isoformat():
+                log.info('No watchlist from previous trading day; skipping new entries')
+                return
+        candidates = saved.get('candidates', [])
+        log.info('Live paper evaluation: %d saved candidates', len(candidates))
+    else:
+        stocks, indices = load_universe()
+        universe = pd.concat([stocks,indices], ignore_index=True)
+        if universe.empty:
+            raise RuntimeError('Dhan F&O universe empty; no new watchlist')
+        f = fetch_fii_dii_nse()
+        fii, dii = (f.get('fii'), f.get('dii')) if 'error' not in f else (None, None)
+        cache = get_cache()
+        errors=[]
+        cutoff = now.date()
+        for _, x in universe.iterrows():
+            x = x.to_dict()
+            try:
+                d = load_daily(api, cache, x, cutoff)
+                if d.empty or d.index[-1].date() != cutoff:
+                    continue
+                row, _ = analyze_instrument(x, d, cfg, fii, dii)
+                if row.get('Eligible'):
+                    candidates.append(row)
+            except Exception as e:
+                errors.append((x.get('symbol'), str(e)[:110]))
+        log.info('Daily scan: %d instruments, %d candidates, %d failures',len(universe),len(candidates),len(errors))
+        for sym, err in errors[:10]: log.warning('%s: %s',sym,err)
+        candidates.sort(key=lambda x:(-x['Score'],-x['ADX']))
+        # Store JSON-safe values; never store option quotes as executable prices.
+        safe = json.loads(json.dumps(candidates, default=str).replace('NaN', 'null'))
+        gist_watchlist(gist_token, gist_id, {'created': cutoff.isoformat(), 'candidates': safe})
+        log.info('Saved %d candidates for NEXT trading session. No after-hours paper entries.',len(safe))
+        return
+    # A saved daily setup is a candidate, NOT an execution signal. Intraday
+    # price confirmation is required before any simulated position is opened.
+    # Current Dhan daily API cannot establish a completed 5-minute confirmation,
+    # so live mode updates exits and publishes candidates but does NOT fabricate entries.
+    log.info('Live watchlist loaded; paper entries disabled until 5-minute confirmation is implemented.')
+    return
     log.info('Completed unattended swing-paper cycle')
 
 
