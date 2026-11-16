@@ -61,3 +61,7 @@ Rows and signal cards show the source, and diagnostics indicate missing bars.
 Yahoo-sourced candidates stay out of dashboard automatic paper entries.
 Dhan still supplies the instrument list, option contracts, quotes and simulated
 fills. This does not change the Intraday project or the separate backtest.
+
+## Private Streamlit edition
+
+Follow START-HERE.txt in the delivery. Set APP_PASSWORD and both Dhan keys in Streamlit Secrets. This edition uses dashboard mode only. External-worker instructions below or above do not apply.

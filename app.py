@@ -40,6 +40,7 @@ import altair as alt
 from underlying_backtest import render_backtest
 from decision_panel import show_panel, load_quote, context
 from swing_data import yahoo_batch, yahoo_ticker
+from dashboard_auth import require_password, read_secret
 
 IST = ZoneInfo('Asia/Kolkata')
 BASE = 'https://api.dhan.co/v2'
@@ -1223,22 +1224,20 @@ def candle_chart(df):
 
 def main():
     st.set_page_config(page_title='Dhan Swing Options V3.8 Neon', page_icon='📊', layout='wide')
+    require_password('Dhan Swing')
     apply_dark_theme()
     st.title('DHAN QUANT · SWING OPTIONS TERMINAL')
     st.caption('Dhan daily prices + Yahoo after-close fallback · Dhan option quotes · manual execution · no orders are ever sent · research tool, not advice, no guaranteed profit')
 
-    def secret(name):
-        try: return os.getenv(name) or st.secrets.get(name, '')
-        except Exception: return os.getenv(name, '')
-
-    from worker_store import cloud_journal, enabled
-    worker_mode=enabled(secret('PAPER_WORKER_MODE'))
+    secret = read_secret
+    from worker_store import cloud_journal
+    worker_mode=False
+    token = secret('DHAN_ACCESS_TOKEN')
+    client_id = secret('DHAN_CLIENT_ID')
     with st.sidebar:
-        if worker_mode:st.info('Paper trading is managed by the external worker. Sidebar settings apply to dashboard scans only.')
         st.header('Dhan connection')
-        token = st.text_input('Access token', value=secret('DHAN_ACCESS_TOKEN'), type='password')
-        client_id = st.text_input('Client ID', value=secret('DHAN_CLIENT_ID'))
-        st.caption('Dhan access tokens expire (usually in 24h). If Dhan returns 401 / DH-901, generate a new token for Dhan prices and option quotes.')
+        st.caption('Dhan credentials configured on server.' if token and client_id else
+                   'Dhan credentials missing in Streamlit Secrets. Yahoo may serve the after-close watchlist.')
         st.header('Risk')
         capital = st.number_input('Capital (Rs)', 10000, 100000000, 100000, 5000)
         risk_pct = st.slider('Risk per trade (%)', 1.0, 2.0, 1.0, 0.5)
