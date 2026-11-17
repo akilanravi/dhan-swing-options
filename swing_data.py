@@ -38,13 +38,13 @@ def normalize_yahoo(frame, cutoff):
     return out
 
 
-def yahoo_batch(targets, cutoff, cache, downloader=None):
+def yahoo_batch(targets, cutoff, cache, downloader=None, *, min_history=215):
     """Fetch only requested fallback symbols, one batch, with bounded threads."""
     tickers = sorted({t for x in targets if (t := yahoo_ticker(x))})
     found, missing, notes = {}, [], {}
     for t in tickers:
         hit = cache.get(yahoo_cache_key(t, cutoff), ttl=300)
-        if hit is not None:
+        if hit is not None and len(hit)>=min_history:
             found[t] = hit
         else:
             missing.append(t)
@@ -80,8 +80,8 @@ def yahoo_batch(targets, cutoff, cache, downloader=None):
         # Require a full warm-up and a valid dated bar. Never cache stale data.
         if actual != cutoff:
             notes[t] = f'Yahoo candle date: {actual or "unavailable"}'
-        elif len(d) < 215:
-            notes[t] = f'Yahoo returned only {len(d)} usable daily candles (need 215+)'
+        elif len(d) < min_history:
+            notes[t] = f'Yahoo returned only {len(d)} usable daily candles (need {min_history}+)'
         else:
             d.attrs.update(candle_source='Yahoo Finance', yahoo_ticker=t)
             cache.put(yahoo_cache_key(t, cutoff), d)

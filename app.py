@@ -39,7 +39,7 @@ import requests
 import streamlit as st
 import altair as alt
 from underlying_backtest import render_backtest
-from swing_breakout import DAILY_METHODS, prepare_daily, signal_rows
+from monthly_breakouts import make_snapshot
 from swing_breakout_view import render_swing_breakout
 from decision_panel import show_panel, load_quote, context
 from swing_data import yahoo_batch, yahoo_ticker
@@ -280,8 +280,8 @@ def get_scan_store():
 
 
 class MissingSessionCandle(ValueError):
-    def __init__(self, expected, actual):
-        self.expected, self.actual = expected, actual
+    def __init__(self, expected, actual, history=None):
+        self.expected, self.actual, self.history = expected, actual, history
         super().__init__(f'Expected {expected}, Dhan candles available through {actual or "none"}')
 
 
@@ -300,7 +300,7 @@ def load_daily(api, cache, x, cutoff, force=False, *, require_session=False):
     df = df[df.index.date <= cutoff].sort_index()
     actual = df.index[-1].date() if not df.empty else None
     if require_session and actual != cutoff:
-        raise MissingSessionCandle(cutoff, actual)
+        raise MissingSessionCandle(cutoff, actual, df)
     # Index spot candles carry no volume -> use near-month index-futures volume as proxy (flagged in output).
     if x['instrument'] == 'INDEX' and df.Volume.tail(25).sum() <= 0 and str(x.get('fut_sid', '')).isdigit():
         try:
@@ -341,7 +341,7 @@ def dhan_feed_status(exc, connected=True):
     return 'Dhan feed or data unavailable'
 
 
-def scan_daily_sources(api, cache, targets, cutoff, now, progress=None):
+def scan_daily_sources(api, cache, targets, cutoff, now, progress=None, *, prior_frames=None):
     """Resolve daily bars for a watchlist, with a fast common-delay path."""
     allow_yahoo = swing_after_close(now)
     ready, failed, deferred = {}, {}, {}
@@ -360,6 +360,9 @@ def scan_daily_sources(api, cache, targets, cutoff, now, progress=None):
             failed.pop(sym, None)
         except Exception as e:
             failed[sym] = e
+            if (prior_frames is not None and isinstance(e,MissingSessionCandle)
+                    and e.history is not None and not e.history.empty):
+                prior_frames[sym]=e.history
 
     def dhan_many(items):
         with ThreadPoolExecutor(max_workers=4) as ex:
@@ -385,7 +388,8 @@ def scan_daily_sources(api, cache, targets, cutoff, now, progress=None):
                                     for e in errors if e is not None) and all(e is not None for e in errors)
         if auth:
             auth_error = errors[0]
-        if lag or auth:
+        # A stale sample does not prove individual instruments lack Dhan data.
+        if auth or (lag and prior_frames is None):
             # The sample shows a feed-wide delay or auth issue. Avoid a full
             # serial-rate-limited Dhan pass, but retry Dhan for Yahoo misses.
             for sym, x in list(remaining.items()):
@@ -412,7 +416,7 @@ def scan_daily_sources(api, cache, targets, cutoff, now, progress=None):
             if progress:
                 progress(f'Yahoo Finance fallback · {len(yahoo_targets)} symbols')
             t = time.monotonic()
-            frames, notes = yahoo_batch(yahoo_targets, cutoff, cache)
+            frames, notes = yahoo_batch(yahoo_targets, cutoff, cache, min_history=1 if prior_frames is not None else 215)
             elapsed = time.monotonic() - t
             for x in yahoo_targets:
                 sym, ticker = x['symbol'], yahoo_ticker(x)
@@ -663,7 +667,7 @@ def flow_bias(side, fii, dii):
     return label, (side == 'CE' and label == 'FII+DII selling') or (side == 'PE' and label == 'FII+DII buying')
 
 
-def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0, *, include_breakouts=False):
+def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0):
     sym = x['symbol']
     if len(daily) < 215:
         raise ValueError(f'Only {len(daily)} candles (need 215+)')
@@ -737,29 +741,6 @@ def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0, *, include_breakouts=F
         'Lot size': x.get('lot'), 'Load sec': round(secs, 2),
         'sid': x['sid'], 'segment': x['segment'], 'instrument': x['instrument'],
     }
-    # Read-only breakout metadata. The original analysis and paper engine do not read it.
-    breakout_rows = []
-    if include_breakouts:
-        ranges = prepare_daily(daily)
-        for method in DAILY_METHODS:
-            for event in signal_rows(ranges,method,start_date=d.index[-1]):
-                bs = event['Side']
-                checks = _side_tests(d.tail(1),bs,pd.Series(volavail,index=d.index[-1:]))
-                def reading(key, val):
-                    if key=='volume' and not volavail: return None
-                    return bool(val.iloc[-1])
-                direction=1 if bs=='CE' else -1
-                breakout_rows.append({
-                    'Breakout':'↑ BREAKOUT UP' if bs=='CE' else '↓ BREAKOUT DOWN','Symbol':sym,**event,
-                    'Daily source':row['Daily source'],
-                    'Reference stop ₹':event['Close ₹']-direction*risk,
-                    'Reference 2R ₹':event['Close ₹']+direction*2*risk,
-                    'Existing score':f"{int(r['score_'+bs])}/10",
-                    'Checks':{k:reading(k,v) for k,v in checks.items()},
-                })
-    if include_breakouts:
-        row['_swing_breakouts'] = breakout_rows
-        row['_breakout_feed_status'] = daily.attrs.get('dhan_scan_outcome','Dhan candle verified' if row['Daily source']=='Dhan' else 'Dhan not verified')
     hist = [{'Symbol': sym, 'Date': dt.strftime('%Y-%m-%d'), 'Side': s.signal, 'Score': int(s.score), 'Close': float(s.Close)}
             for dt, s in d.tail(cfg['scan_days']).iterrows() if s.signal]
     return row, hist
@@ -1276,18 +1257,38 @@ def swing_jobs():
 
 def background_swing_scan(token, client_id, cache, targets, cutoff, scan_now_ist, cfg, blackouts, fii, dii):
     api = DhanAPI(token, client_id) if token else None
-    results, hist, errors = [], [], []
+    results, hist, errors, events, coverage = [], [], [], [], []
+    prior_frames={}
     t0 = time.monotonic()
-    ready, failed, yahoo_notes = scan_daily_sources(
-        api, cache, targets, cutoff, scan_now_ist)
+    try:
+        ready, failed, yahoo_notes = scan_daily_sources(
+            api, cache, targets, cutoff, scan_now_ist, prior_frames=prior_frames)
+    finally:
+        if api is not None: api.session.close()
     for i, x in enumerate(targets, 1):
         sym = x['symbol']
+        providers=[]
+        if sym in prior_frames:
+            providers.append((prior_frames[sym],'Dhan',f'Dhan available through {prior_frames[sym].index[-1].date()}'))
+        if sym in ready:
+            d,_=ready[sym]
+            source=d.attrs.get('candle_source','Dhan')
+            if source=='Dhan': providers=[]
+            providers.append((d,source,d.attrs.get('dhan_scan_outcome','Dhan candle verified')))
+        for d,source,status in providers:
+            try:
+                records,stat=make_snapshot(sym,d,cutoff,indicators,_side_tests,source,status)
+                events.extend(records)
+                coverage.append(stat)
+            except Exception as exc:
+                errors.append({'Symbol':sym,'Status':'BREAKOUT CALCULATION FAILED',
+                               'Expected date':cutoff.isoformat(),'Dhan outcome':status,'Error':type(exc).__name__})
         try:
             if sym in failed:
                 raise failed[sym]
             daily, secs = ready[sym]
             c = dict(cfg); c['event_blackout_dates'] = {sym: blackouts}
-            row, h = analyze_instrument(x, daily, c, fii, dii, secs, include_breakouts=True)
+            row, h = analyze_instrument(x, daily, c, fii, dii, secs)
             results.append(row); hist += h
         except Exception as e:
             stale = isinstance(e, MissingSessionCandle)
@@ -1301,7 +1302,7 @@ def background_swing_scan(token, client_id, cache, targets, cutoff, scan_now_ist
     if not df.empty:
         df['_r'] = df.Status.map(STATUS_RANK)
         df = df.sort_values(['_r', 'Score', 'ADX'], ascending=[True, False, False]).drop(columns='_r').reset_index(drop=True)
-    return df, (pd.DataFrame(hist).drop_duplicates(['Symbol','Date','Side']) if hist else pd.DataFrame()), pd.DataFrame(errors), len(targets), time.monotonic()-t0
+    return df, (pd.DataFrame(hist).drop_duplicates(['Symbol','Date','Side']) if hist else pd.DataFrame()), pd.DataFrame(errors), len(targets), time.monotonic()-t0, events, coverage
 
 
 @st.fragment(run_every=3)
@@ -1387,7 +1388,7 @@ def main():
     expected = last_complete_session(scan_now_ist)
     store = get_scan_store()
     skey = hashlib.sha256((token or 'none').encode()).hexdigest()[:12]
-    scan_key = ('mtd-yahoo-v2', skey, expected.isoformat())
+    scan_key = ('monthly-breakouts-v3', skey, expected.isoformat())
     if ss.get('scan_key') != scan_key:
         saved = store.get(scan_key, {})
         ss.scan, ss.history = saved.get('scan', pd.DataFrame()), saved.get('history', pd.DataFrame())
@@ -1405,15 +1406,24 @@ def main():
         if pending is not None and pending[0].done():
             future, owner_nonce=jobs.pop(scan_key)
             try:
-                frame, history, errors, requested, seconds=future.result()
+                frame, history, errors, requested, seconds, events, coverage=future.result()
+                old_breakout=store.get(scan_key,{})
+                monthly_fields=({'breakout_events':events,'breakout_coverage':coverage,
+                                 'breakout_snapshot_date':expected,'breakout_requested':requested}
+                                if coverage else {k:old_breakout[k] for k in ('breakout_events','breakout_coverage','breakout_snapshot_date','breakout_requested')
+                                                  if k in old_breakout})
                 store[scan_key]={'scan':frame,'history':history,'errors':errors,
                                  'summary':f'{len(frame)} of {requested} current candles · {seconds:.1f} seconds',
-                                 'requested':requested,'revision':id(future)}
-                finished_for_owner=(owner_nonce==ss[NONCE])
+                                 'requested':requested,'revision':id(future),**monthly_fields}
+                finished_for_owner=(owner_nonce is not None and owner_nonce==ss[NONCE])
             except Exception as exc:
-                store[scan_key]={'scan':pd.DataFrame(),'history':pd.DataFrame(),
-                                 'errors':pd.DataFrame([{'Error':type(exc).__name__}]),
+                prior={k:v for k,v in store.get(scan_key,{}).items() if k.startswith('breakout_')}
+                store[scan_key]={'scan':pd.DataFrame(),'history':pd.DataFrame(),**prior,
+                                 'errors':pd.DataFrame([{'Status':'BACKGROUND SCAN FAILED','Error':type(exc).__name__}]),
                                  'summary':'Background scan failed. Please retry.','revision':id(future)}
+        old_keys=sorted((k for k in store if k[:2]==scan_key[:2] and k!=scan_key),key=lambda k:k[2],reverse=True)
+        for k in old_keys[2:]:
+            store.pop(k,None)
         active=jobs.get(scan_key)
         saved=store.get(scan_key,{})
         if ss.get('scan_revision')!=saved.get('revision'):
@@ -1438,8 +1448,11 @@ def main():
         ss.gist_id = journal.gist_id
 
     cache = get_cache()
-    breakout_scan=saved.get('scan',ss.scan)
-    ss.scan=ss.scan.drop(columns=['_swing_breakouts','_breakout_feed_status'],errors='ignore')
+    with jobs_lock:
+        previous_monthly=[v for k,v in store.items() if k[:2]==scan_key[:2] and k[2]<=scan_key[2]
+                          and v.get('breakout_coverage')]
+        breakout_snapshot=max(previous_monthly,key=lambda v:v['breakout_snapshot_date'],default={})
+
     t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards','6 · Trade Decision','7 · Call / Put Backtest','8 · ⚡ Swing Breakout'])
 
     def auto_paper_cycle(api, candidates=None):
@@ -1555,23 +1568,26 @@ def main():
         if finished_for_owner and token and (auto_exit or (not ss.scan.empty and auto_paper)):
             for message in auto_paper_cycle(DhanAPI(token,client_id), ss.scan if not ss.scan.empty else None):
                 st.info(message)
-        if st.button('SCAN NOW', type='primary', disabled=active is not None or not (len(stocks) and (token or swing_after_close(scan_now_ist)))):
-            cutoff = expected
-            pool = stocks if (scan_all or only) else stocks.head(int(n_limit))
-            targets = pool.to_dict('records')
-            if only:
-                want = {s.strip().upper() for s in only.split(',') if s.strip()}
-                targets = [x for x in targets if x['symbol'] in want]
-                if inc_idx: targets = [x for x in indices.to_dict('records') if x['symbol'] in want] + targets
-            elif inc_idx:
-                targets = indices.to_dict('records') + targets
+        pool = stocks if (scan_all or only) else stocks.head(int(n_limit))
+        targets = pool.to_dict('records')
+        if only:
+            want = {s.strip().upper() for s in only.split(',') if s.strip()}
+            targets = [x for x in targets if x['symbol'] in want]
+            if inc_idx: targets = [x for x in indices.to_dict('records') if x['symbol'] in want] + targets
+        elif inc_idx:
+            targets = indices.to_dict('records') + targets
+
+        def launch_swing_scan(owner):
             with jobs_lock:
-                existing = jobs.get(scan_key)
-                if existing is None:
+                if scan_key not in jobs:
                     jobs[scan_key] = (pool_exec.submit(background_swing_scan,token,client_id,cache,
-                                                        targets,cutoff,scan_now_ist,cfg,blackouts,fii,dii),
-                                      ss[NONCE])
+                                                       targets,expected,scan_now_ist,cfg,blackouts,fii,dii),
+                                      owner)
             st.rerun()
+
+        can_scan=bool(targets) and (bool(token) or swing_after_close(scan_now_ist))
+        if st.button('SCAN NOW', type='primary', disabled=active is not None or not can_scan):
+            launch_swing_scan(ss[NONCE])
         if active is not None:
             st.info('Swing scan is running on the server. Minimizing or locking the window does not restart it.')
         if not ss.scan_errors.empty:
@@ -1964,14 +1980,20 @@ def main():
         render_backtest(pd.concat([indices,stocks],ignore_index=True),token,client_id,DhanAPI,'Daily')
 
     with t8:
-        def swing_breakout_quote(symbol,side):
-            row=ss.scan.loc[ss.scan.Symbol.eq(symbol)].iloc[0].to_dict()
+        if st.button('Refresh monthly breakouts',key='month_swing_refresh',type='primary',
+                     disabled=active is not None or not can_scan,
+                     help='Uses the universe selected in Market Scanner. This button does not run the paper-trading cycle.'):
+            launch_swing_scan(None)
+        by_symbol={x['symbol']:x for x in pd.concat([stocks,indices]).to_dict('records')}
+        def swing_breakout_quote(event):
+            spec=by_symbol[event['Symbol']]
+            meta={**spec,'Symbol':event['Symbol'],'Side':event['Side'],
+                  'Close':event['Close ₹'],'Lot size':spec.get('lot')}
             api=DhanAPI(token,client_id)
             with api.session:
-                return option_for_setup(api,{**row,'Side':side},opt_params,{})
-        render_swing_breakout(breakout_scan,stocks,expected,token,client_id,DhanAPI,swing_breakout_quote,
-                              errors=ss.scan_errors, scanning=active is not None, scanned=bool(saved.get('revision')),
-                              requested=saved.get('requested'))
+                return option_for_setup(api,meta,opt_params,{})
+        render_swing_breakout(breakout_snapshot,stocks,expected,token,client_id,DhanAPI,swing_breakout_quote,
+                              errors=ss.scan_errors, scanning=active is not None, scanned=bool(saved.get('revision')))
 
 if __name__ == "__main__":
     main()
