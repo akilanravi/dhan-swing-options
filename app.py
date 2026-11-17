@@ -29,6 +29,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import RLock
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -40,7 +41,7 @@ import altair as alt
 from underlying_backtest import render_backtest
 from decision_panel import show_panel, load_quote, context
 from swing_data import yahoo_batch, yahoo_ticker
-from dashboard_auth import require_password, read_secret
+from dashboard_auth import require_password, read_secret, is_authenticated, NONCE
 
 IST = ZoneInfo('Asia/Kolkata')
 BASE = 'https://api.dhan.co/v2'
@@ -1222,6 +1223,45 @@ def candle_chart(df):
 
 
 
+@st.cache_resource
+def swing_jobs():
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix='swing-scan'), RLock(), {}
+
+def background_swing_scan(token, client_id, cache, targets, cutoff, scan_now_ist, cfg, blackouts, fii, dii):
+    api = DhanAPI(token, client_id) if token else None
+    results, hist, errors = [], [], []
+    t0 = time.monotonic()
+    ready, failed, yahoo_notes = scan_daily_sources(
+        api, cache, targets, cutoff, scan_now_ist)
+    for i, x in enumerate(targets, 1):
+        sym = x['symbol']
+        try:
+            if sym in failed:
+                raise failed[sym]
+            daily, secs = ready[sym]
+            c = dict(cfg); c['event_blackout_dates'] = {sym: blackouts}
+            row, h = analyze_instrument(x, daily, c, fii, dii, secs)
+            results.append(row); hist += h
+        except Exception as e:
+            stale = isinstance(e, MissingSessionCandle)
+            errors.append({'Symbol': sym, 'Status': 'STALE / MISSING CANDLE' if stale else 'SCAN FAILED',
+                           'Expected date': cutoff.isoformat(),
+                           'Dhan candle date': e.actual.isoformat() if stale and e.actual else '',
+                           'Yahoo status': yahoo_notes.get(sym, ''),
+                           'Error': str(e)})
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df['_r'] = df.Status.map(STATUS_RANK)
+        df = df.sort_values(['_r', 'Score', 'ADX'], ascending=[True, False, False]).drop(columns='_r').reset_index(drop=True)
+    return df, (pd.DataFrame(hist).drop_duplicates(['Symbol','Date','Side']) if hist else pd.DataFrame()), pd.DataFrame(errors), len(targets), time.monotonic()-t0
+
+
+@st.fragment(run_every=3)
+def watch_swing_job(future):
+    if not is_authenticated() or (future is not None and future.done()):
+        st.rerun()
+
+
 def main():
     st.set_page_config(page_title='Dhan Swing Options V3.8 Neon', page_icon='📊', layout='wide')
     require_password('Dhan Swing')
@@ -1306,6 +1346,35 @@ def main():
         ss.scan_errors = saved.get('errors', pd.DataFrame())
         ss.options = {}
         ss.scan_key = scan_key
+    pool_exec,jobs_lock,jobs=swing_jobs()
+    finished_for_owner=False
+    with jobs_lock:
+        # Only one scan per data account/session date; all viewers share its result.
+        for key in list(jobs):
+            if key!=scan_key and jobs[key][0].done():
+                jobs.pop(key)
+        pending=jobs.get(scan_key)
+        if pending is not None and pending[0].done():
+            future, owner_nonce=jobs.pop(scan_key)
+            try:
+                frame, history, errors, requested, seconds=future.result()
+                store[scan_key]={'scan':frame,'history':history,'errors':errors,
+                                 'summary':f'{len(frame)} of {requested} current candles · {seconds:.1f} seconds',
+                                 'revision':id(future)}
+                finished_for_owner=(owner_nonce==ss[NONCE])
+            except Exception as exc:
+                store[scan_key]={'scan':pd.DataFrame(),'history':pd.DataFrame(),
+                                 'errors':pd.DataFrame([{'Error':type(exc).__name__}]),
+                                 'summary':'Background scan failed. Please retry.','revision':id(future)}
+        active=jobs.get(scan_key)
+        saved=store.get(scan_key,{})
+        if ss.get('scan_revision')!=saved.get('revision'):
+            ss.scan=saved.get('scan',pd.DataFrame())
+            ss.history=saved.get('history',pd.DataFrame())
+            ss.scan_errors=saved.get('errors',pd.DataFrame())
+            ss.options={}
+            ss.scan_revision=saved.get('revision')
+    watch_swing_job(active[0] if active else None)
     ss.setdefault('options', {})
     ss.setdefault('scan_errors', pd.DataFrame())
     ss.setdefault('seg_memory', {})
@@ -1431,9 +1500,12 @@ def main():
         n_limit = cc2.number_input('…or first N stocks', 1, 400, 30, disabled=scan_all)
         only = cc3.text_input('Only these symbols (optional, comma separated)', '')
         inc_idx = st.checkbox('Include indices (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50)', True)
-        workers = 4
-        if st.button('SCAN NOW', type='primary', disabled=not (len(stocks) and (token or swing_after_close(scan_now_ist)))):
-            api = DhanAPI(token, client_id) if token else None
+        if saved.get('summary'):
+            st.caption(saved['summary'])
+        if finished_for_owner and token and (auto_exit or (not ss.scan.empty and auto_paper)):
+            for message in auto_paper_cycle(DhanAPI(token,client_id), ss.scan if not ss.scan.empty else None):
+                st.info(message)
+        if st.button('SCAN NOW', type='primary', disabled=active is not None or not (len(stocks) and (token or swing_after_close(scan_now_ist)))):
             cutoff = expected
             pool = stocks if (scan_all or only) else stocks.head(int(n_limit))
             targets = pool.to_dict('records')
@@ -1443,57 +1515,15 @@ def main():
                 if inc_idx: targets = [x for x in indices.to_dict('records') if x['symbol'] in want] + targets
             elif inc_idx:
                 targets = indices.to_dict('records') + targets
-            results, hist, errors = [], [], []
-            prog = st.progress(0.0, text='Starting…')
-            t0 = time.monotonic()
-            ready, failed, yahoo_notes = scan_daily_sources(
-                api, cache, targets, cutoff, scan_now_ist,
-                progress=lambda msg: prog.progress(0.35, text=msg))
-            for i, x in enumerate(targets, 1):
-                sym = x['symbol']
-                try:
-                    if sym in failed:
-                        raise failed[sym]
-                    daily, secs = ready[sym]
-                    c = dict(cfg); c['event_blackout_dates'] = {sym: blackouts}
-                    row, h = analyze_instrument(x, daily, c, fii, dii, secs)
-                    results.append(row); hist += h
-                except Exception as e:
-                    stale = isinstance(e, MissingSessionCandle)
-                    errors.append({'Symbol': sym, 'Status': 'STALE / MISSING CANDLE' if stale else 'SCAN FAILED',
-                                   'Expected date': cutoff.isoformat(),
-                                   'Dhan candle date': e.actual.isoformat() if stale and e.actual else '',
-                                   'Yahoo status': yahoo_notes.get(sym, ''),
-                                   'Error': str(e)})
-                prog.progress(0.35 + 0.65 * i / len(targets), text=f'Checking setups · {i}/{len(targets)}')
-            prog.empty()
-            df = pd.DataFrame(results)
-            if not df.empty:
-                df['_r'] = df.Status.map(STATUS_RANK)
-                df = df.sort_values(['_r', 'Score', 'ADX'], ascending=[True, False, False]).drop(columns='_r').reset_index(drop=True)
-            # Each click replaces the scan, including a failed or symbol-only run.
-            # Old rows must never remain eligible after a failed recheck.
-            ss.scan = df
-            ss.history = pd.DataFrame(hist).drop_duplicates(['Symbol', 'Date', 'Side']) if hist else pd.DataFrame()
-            ss.options = {}
-            ss.scan_errors = pd.DataFrame(errors)
-            store[scan_key] = {'scan': ss.scan, 'history': ss.history, 'errors': ss.scan_errors}
-            stale_count = sum(e['Status'] == 'STALE / MISSING CANDLE' for e in errors)
-            yahoo_count = sum(r['Daily source'] == 'Yahoo Finance' for r in results)
-            summary = (f'{len(results)} of {len(targets)} dated {cutoff} in '
-                       f'{time.monotonic() - t0:.0f}s · Dhan {len(results)-yahoo_count} · Yahoo {yahoo_count} · '
-                       f'{stale_count} stale/missing · {len(errors)-stale_count} failed')
-            if results and not errors:
-                st.success(summary)
-            elif results:
-                st.warning(summary)
-            elif targets:
-                st.warning(summary + ' · No verified watchlist. Neither available source supplied usable data for the expected date.')
-            else:
-                st.warning('No matching instruments. Check the symbol names and index filter.')
-            if api is not None and not worker_mode and (auto_exit or (results and auto_paper)):
-                for message in auto_paper_cycle(api, ss.scan if results else None):
-                    st.info(message)
+            with jobs_lock:
+                existing = jobs.get(scan_key)
+                if existing is None:
+                    jobs[scan_key] = (pool_exec.submit(background_swing_scan,token,client_id,cache,
+                                                        targets,cutoff,scan_now_ist,cfg,blackouts,fii,dii),
+                                      ss[NONCE])
+            st.rerun()
+        if active is not None:
+            st.info('Swing scan is running on the server. Minimizing or locking the window does not restart it.')
         if not ss.scan_errors.empty:
             with st.expander(f'{len(ss.scan_errors)} instruments excluded · candle date / error details', expanded=ss.scan.empty):
                 show(ss.scan_errors)
