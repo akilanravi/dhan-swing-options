@@ -1,12 +1,13 @@
 """Swing breakouts and one-click historical direction comparison. Read-only."""
-from datetime import date
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from swing_breakout import DAILY_METHODS, METHODS, compare, summarize
-from monthly_breakouts import month_labels, provider_filtered
+from swing_breakout import DAILY_METHODS, METHODS, WEEK, compare, summarize
+from monthly_breakouts import month_labels, provider_filtered, session_sources
 from underlying_backtest import load_bars
 
 LABELS = dict(ema200='Price vs EMA200',ema50='EMA50 vs EMA200',st='Supertrend (10,3)',
@@ -16,9 +17,9 @@ AUDIT = Path(__file__).with_name('breakout_reference')
 
 
 def render_swing_breakout(snapshot, stocks, expected, token, client_id, make_api, quote_for=None,
-                          *, errors=None, scanning=False, scanned=False):
+                          *, errors=None, scanning=False, scanned=False, next_session=None, review=None):
     st.subheader('⚡ Monthly Swing Breakouts')
-    live, history = st.tabs(['Monthly breakout log', 'Historical comparison'])
+    live, history, next_history = st.tabs(['Monthly breakout log', 'Historical comparison', 'Next-session research'])
     with live:
         st.caption('One row per symbol, signal date and selected method. Dates are daily-close confirmations, not the time price first crossed intraday. A daily breakout is known after the 15:30 IST close. For a new same-day scan, the app waits until 15:45 IST.')
         latest=snapshot.get('breakout_snapshot_date')
@@ -40,9 +41,16 @@ def render_swing_breakout(snapshot, stocks, expected, token, client_id, make_api
                  'Sessions checkable this month':sum(t.startswith(month) for t in c['days'].get(method,set()))}) for c in coverage]
         ds={c['Symbol'] for c in feeds if c['Daily source']=='Dhan' and c['Sessions checkable this month']}
         ys={c['Symbol'] for c in feeds if c['Daily source']=='Yahoo Finance' and c['Sessions checkable this month']}
-        latest_dhan=sum(c['Daily source']=='Dhan' and expected.isoformat() in c['days'].get(method,set()) for c in coverage)
-        st.caption(f"Expected latest session {expected:%d %b %Y} · Dhan coverage this month {len(ds)} · Yahoo coverage this month {len(ys)} · Dhan ready for latest session {latest_dhan}"+(f" · Requested {size} instruments" if size is not None else ''))
+        st.caption(f"Expected latest session {expected:%d %b %Y} · Dhan coverage this month {len(ds)} · Yahoo coverage this month {len(ys)}"+(f" · Requested {size} instruments" if size is not None else ''))
         with st.expander('Scan data status',expanded=not coverage and (scanning or scanned)):
+            methods=[]
+            for m in DAILY_METHODS:
+                dh,ya=session_sources(coverage,m,expected.isoformat())
+                de=provider_filtered(events,coverage,m,expected.isoformat(),False)
+                com=provider_filtered(events,coverage,m,expected.isoformat(),True)
+                methods.append({'Method':m,'Date':expected.isoformat(),'Dhan ready':len(dh),'Yahoo-only ready':len(ya),
+                                'Dhan breakouts':len(de),'Yahoo-only breakouts':len(com)-len(de)})
+            st.dataframe(pd.DataFrame(methods),width='stretch',hide_index=True)
             if feeds:
                 st.dataframe(pd.DataFrame(feeds),width='stretch',hide_index=True)
             if errors is not None and not errors.empty:
@@ -53,11 +61,34 @@ def render_swing_breakout(snapshot, stocks, expected, token, client_id, make_api
                 st.caption('No history has been confirmed by this scan.')
         visible=provider_filtered(events,coverage,method,month,include)
         if direction!='Both': visible=[v for v in visible if v['Side']==direction]
-        if origin!='Entire month': visible=[v for v in visible if v['Session date']==expected.isoformat()]
+        expected_iso=expected.isoformat()
+        dates={t for c in coverage for t in c['days'].get(method,set()) if t.startswith(month)}
+        if expected_iso.startswith(month): dates.add(expected_iso)
+        date_to_check=expected_iso if expected_iso.startswith(month) else None
         if origin=='Entire month':
-            dates=sorted({v['Session date'] for v in visible},reverse=True)
-            selected_date=st.selectbox('Signal date', ['All dates',*dates],key='month_swing_signal_day')
-            if selected_date!='All dates': visible=[v for v in visible if v['Session date']==selected_date]
+            selected_date=st.selectbox('Signal date', ['All dates',*sorted(dates,reverse=True)],key='month_swing_signal_day')
+            if selected_date!='All dates':
+                visible=[v for v in visible if v['Session date']==selected_date]
+                date_to_check=selected_date
+        else:
+            date_to_check=max(dates,default=None)
+            visible=[v for v in visible if v['Session date']==date_to_check]
+        date_restrict=False
+        if date_to_check:
+            dh,ya=session_sources(coverage,method,date_to_check)
+            date_visible=provider_filtered(events,coverage,method,date_to_check,include)
+            if direction!='Both':
+                date_visible=[e for e in date_visible if e['Side']==direction]
+            st.caption(f'{date_to_check} · Dhan ready {len(dh)} · Yahoo-only ready {len(ya)} · {len(date_visible)} matching events before the symbol filter.')
+            date_restrict=not dh and not (include and ya) and (origin!='Entire month' or selected_date!='All dates')
+            if not dh and ya and not include:
+                st.warning(f'{date_to_check} has no usable Dhan candles for this method. Enable the Yahoo fallback above to view the available same-date data.')
+            elif not dh and not ya:
+                st.warning(f'{date_to_check} has no verified candles with sufficient history for this method yet. Older rows below are not signals for this date.')
+            elif not dh and ya and include:
+                st.info(f'{date_to_check} is using labelled Yahoo watchlist data, not Dhan candles.')
+            elif size and len(dh)<size and not include:
+                st.caption(f'Dhan coverage for this session is partial ({len(dh)} of {size}). An empty list is not a market-wide result.')
         stock_names=sorted({v['Symbol'] for v in visible})
         picked=st.multiselect('Filter symbols (optional)',stock_names,key='month_swing_symbols')
         if picked: visible=[v for v in visible if v['Symbol'] in picked]
@@ -69,7 +100,7 @@ def render_swing_breakout(snapshot, stocks, expected, token, client_id, make_api
                 st.warning('Only Yahoo has usable history for this month. You can opt in to the labelled fallback watchlist or keep the view Dhan-only.')
             elif not (ds or (ys and include)):
                 st.info('No candles with enough range history in this month for the selected method and source.')
-            else:
+            elif not date_restrict:
                 st.info('History was checked. No breakout matches these filters.')
         else:
             visible.sort(key=lambda e:(e['Session date'],abs(e['Beyond level %'])),reverse=True)
@@ -107,6 +138,8 @@ def render_swing_breakout(snapshot, stocks, expected, token, client_id, make_api
             event=options[choice]
             st.markdown(f"**{event['Breakout']} · {choice} · ₹{event['Close ₹']:,.2f} · broke ₹{event['Level ₹']:,.2f}**")
             st.caption(f"Candle source · {event['Daily source']}")
+            if token and next_session and review:
+                render_opening_review(event,next_session,review)
             if event['Session date']==expected.isoformat() and token and quote_for:
                 if st.button('Check current Dhan option quote',key='month_swing_quote'):
                     try:
@@ -123,6 +156,70 @@ def render_swing_breakout(snapshot, stocks, expected, token, client_id, make_api
                     else: st.info(q.get('Note') or 'No matching option found.')
     with history:
         render_history(stocks,expected,token,client_id,make_api)
+    with next_history:
+        render_next_reference()
+
+
+def render_opening_review(event,next_session,review):
+    day=next_session(date.fromisoformat(event['Session date']))
+    ist=ZoneInfo('Asia/Kolkata')
+    now=datetime.now(ist)
+    cutoff=datetime.combine(day,time(9,30),tzinfo=ist)
+    keys=(event['Symbol'],event['Session date'],event['Method'],event['Side'],event['Daily source'],event['Close ₹'],event['Level ₹'])
+    with st.expander(f'Next-session opening review · {day:%d %b %Y} IST'):
+        st.caption('Watchlist context only. This does not calculate an option return, place a trade, or trigger a paper entry.')
+        if now<cutoff:
+            st.info(f'Wait for the {day:%d %b} 09:15–09:30 IST candle to complete. No confirmation yet.')
+            return
+        if st.button('Load first 15-minute Dhan candle',key='swing_open_review'):
+            try:
+                result=review(event,day)
+                if result is None:
+                    st.session_state['opening_review']=(keys,None,'Dhan did not return the exact 09:15 IST candle for this session.')
+                else:
+                    st.session_state['opening_review']=(keys,result,'')
+            except Exception:
+                st.session_state['opening_review']=(keys,None,'Opening candle unavailable from Dhan. Check access or retry.')
+        saved=st.session_state.get('opening_review')
+        if not saved or saved[0]!=keys:
+            return
+        r=saved[1]
+        if r is None:
+            st.info(saved[2])
+            return
+        for col, (title,value) in zip(st.columns(3),
+                                      [('Opening gap',r['gap_pct']),('09:15 → 09:30',r['first_15m_pct']),
+                                       ('09:30 vs signal close',r['vs_prior_pct'])]):
+            col.metric(title,f'{value:+.2f}%')
+        st.caption(f"Dhan underlying candle · Open ₹{r['open']:,.2f} · Close ₹{r['close']:,.2f}")
+        for title,ok in [('First candle agrees with the signal',r['first_candle_agrees']),
+                         ('Beyond the prior signal close',r['beyond_prior_close']),
+                         ('Still beyond the broken level',r['broken_level_holds']),
+                         ('Retest and move back beyond the broken level',r['retest'])]:
+            st.write(('✓ ' if ok else '✗ ')+title)
+        if event['Method']==WEEK and event['Side']=='CE' and r['confirm']:
+            st.info('Matches the prior-week upside + 09:30 confirmation research filter. It did not beat its matched comparison in the November holdout.')
+
+
+def render_next_reference():
+    f=AUDIT/'next_session_summary.csv'
+    if not f.exists():
+        st.info('Install the breakout_reference folder from this release to load the completed research comparison.')
+        return
+    st.markdown((AUDIT/'NEXT_SESSION.md').read_text(encoding='utf-8'))
+    summary=pd.read_csv(f)
+    cols=st.columns(3)
+    period=cols[0].selectbox('Sample',['Nov holdout','Sep–Oct'],key='nextref_sample')
+    horizon=cols[1].selectbox('Exit time (IST)',['10:30','EOD'],key='nextref_exit')
+    side=cols[2].selectbox('Signal direction',['CE','PE','Both'],key='nextref_side')
+    view=summary[summary.Period.eq(period)&summary.Exit.eq(horizon)]
+    if side!='Both':
+        view=view[view.Side.eq(side)]
+    st.dataframe(view.style.format(precision=3,na_rep='—'),width='stretch',hide_index=True)
+    st.download_button('Download next-session backtest summary',f.read_bytes(),'next_session_summary.csv',key='nextref_download')
+    trades=AUDIT/'next_session_trades.csv'
+    if trades.exists():
+        st.download_button('Download next-session trade log',trades.read_bytes(),'next_session_trades.csv',key='nextref_trades')
 
 
 def render_history(stocks,expected,token,client_id,make_api):

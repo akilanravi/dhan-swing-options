@@ -87,3 +87,15 @@ def provider_filtered(events, coverage, method, requested_month, include_fallbac
         elif include_fallback and date not in prefer.get(e['Symbol'],set()):
             out.append(e)
     return out
+
+
+def session_sources(coverage, method, session):
+    """Return per-symbol source sets verified for exactly this date and method."""
+    d,y=set(),set()
+    for c in coverage:
+        if session in c['days'].get(method,set()):
+            if c['Daily source']=='Dhan':
+                d.add(c['Symbol'])
+            elif c['Daily source']=='Yahoo Finance':
+                y.add(c['Symbol'])
+    return d,y-d

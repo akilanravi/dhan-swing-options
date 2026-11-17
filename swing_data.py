@@ -1,8 +1,11 @@
 """Swing daily watchlist provider. Never fetches option prices."""
 from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 from threading import Lock
 
 import pandas as pd
+import requests
 
 OHLCV = ['Open', 'High', 'Low', 'Close', 'Volume']
 # Do not substitute ETFs or a different index. Unmapped indices stay on Dhan.
@@ -38,7 +41,28 @@ def normalize_yahoo(frame, cutoff):
     return out
 
 
-def yahoo_batch(targets, cutoff, cache, downloader=None, *, min_history=215):
+def yahoo_chart_daily(ticker, cutoff, get=requests.get):
+    """Recover Yahoo stock history when the batch feed did not deliver it."""
+    t=pd.Timestamp(cutoff,tz='Asia/Kolkata')
+    request={'interval':'1d','period1':int((t-pd.Timedelta(days=420)).timestamp()),
+             'period2':int((t+pd.Timedelta(days=1)).timestamp())}
+    url=f'https://query2.finance.yahoo.com/v8/finance/chart/{quote(ticker,safe="")}'
+    try:
+        r=get(url,params=request,headers={'User-Agent':'Mozilla/5.0'},timeout=8)
+        r.raise_for_status()
+        j=(r.json().get('chart',{}).get('result') or [])[0]
+        meta=j.get('meta',{})
+        if meta.get('symbol','').upper()!=ticker.upper() or meta.get('currency')!='INR' or meta.get('dataGranularity')!='1d':
+            return None
+        q=j['indicators']['quote'][0]
+        index=pd.to_datetime(j['timestamp'],unit='s',utc=True,errors='coerce')
+        f=pd.DataFrame({c:q.get(c.lower(),[float('nan')]*len(index)) for c in OHLCV},index=index)
+        return normalize_yahoo(f,cutoff)
+    except (requests.RequestException,ValueError,IndexError,KeyError,TypeError,AttributeError):
+        return None
+
+
+def yahoo_batch(targets, cutoff, cache, downloader=None, *, min_history=215, chart_retry=False):
     """Fetch only requested fallback symbols, one batch, with bounded threads."""
     tickers = sorted({t for x in targets if (t := yahoo_ticker(x))})
     found, missing, notes = {}, [], {}
@@ -66,7 +90,8 @@ def yahoo_batch(targets, cutoff, cache, downloader=None, *, min_history=215):
         with YAHOO_BATCH_LOCK:
             data = download()
     except Exception as exc:
-        return found, {t: 'Yahoo download failed: ' + type(exc).__name__ for t in missing}
+        data=pd.DataFrame()
+        notes.update({t:'Yahoo download failed: '+type(exc).__name__ for t in missing})
     for t in missing:
         f = pd.DataFrame()
         if isinstance(data, pd.DataFrame) and not data.empty:
@@ -79,11 +104,20 @@ def yahoo_batch(targets, cutoff, cache, downloader=None, *, min_history=215):
         actual = d.index[-1].date() if not d.empty else None
         # Require a full warm-up and a valid dated bar. Never cache stale data.
         if actual != cutoff:
-            notes[t] = f'Yahoo candle date: {actual or "unavailable"}'
+            notes.setdefault(t,f'Yahoo candle date: {actual or "unavailable"}')
         elif len(d) < min_history:
             notes[t] = f'Yahoo returned only {len(d)} usable daily candles (need {min_history}+)'
         else:
             d.attrs.update(candle_source='Yahoo Finance', yahoo_ticker=t)
             cache.put(yahoo_cache_key(t, cutoff), d)
             found[t] = d
+    if chart_retry:
+        remaining=[t for t in missing if t not in found]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for t,d in zip(remaining,pool.map(lambda t:yahoo_chart_daily(t,cutoff),remaining)):
+                if d is not None and len(d)>=min_history and d.index[-1].date()==cutoff:
+                    d.attrs.update(candle_source='Yahoo Finance',yahoo_ticker=t)
+                    cache.put(yahoo_cache_key(t,cutoff),d)
+                    found[t]=d
+                    notes.pop(t,None)
     return found, notes

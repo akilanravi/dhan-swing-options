@@ -40,6 +40,7 @@ import streamlit as st
 import altair as alt
 from underlying_backtest import render_backtest
 from monthly_breakouts import make_snapshot
+from next_session_review import classify_open, fetch_first_15m
 from swing_breakout_view import render_swing_breakout
 from decision_panel import show_panel, load_quote, context
 from swing_data import yahoo_batch, yahoo_ticker
@@ -416,7 +417,8 @@ def scan_daily_sources(api, cache, targets, cutoff, now, progress=None, *, prior
             if progress:
                 progress(f'Yahoo Finance fallback · {len(yahoo_targets)} symbols')
             t = time.monotonic()
-            frames, notes = yahoo_batch(yahoo_targets, cutoff, cache, min_history=1 if prior_frames is not None else 215)
+            frames, notes = yahoo_batch(yahoo_targets, cutoff, cache, min_history=1 if prior_frames is not None else 215,
+                                        chart_retry=prior_frames is not None)
             elapsed = time.monotonic() - t
             for x in yahoo_targets:
                 sym, ticker = x['symbol'], yahoo_ticker(x)
@@ -1388,7 +1390,7 @@ def main():
     expected = last_complete_session(scan_now_ist)
     store = get_scan_store()
     skey = hashlib.sha256((token or 'none').encode()).hexdigest()[:12]
-    scan_key = ('monthly-breakouts-v3', skey, expected.isoformat())
+    scan_key = ('monthly-breakouts-v4', skey, expected.isoformat())
     if ss.get('scan_key') != scan_key:
         saved = store.get(scan_key, {})
         ss.scan, ss.history = saved.get('scan', pd.DataFrame()), saved.get('history', pd.DataFrame())
@@ -1992,8 +1994,17 @@ def main():
             api=DhanAPI(token,client_id)
             with api.session:
                 return option_for_setup(api,meta,opt_params,{})
+        def opening_review(event,session):
+            spec=by_symbol[event['Symbol']]
+            api=DhanAPI(token,client_id)
+            with api.session:
+                bar=fetch_first_15m(api,spec,session)
+            if bar is None:
+                return None
+            return classify_open(event['Side'],event['Close ₹'],event['Level ₹'],*bar)
         render_swing_breakout(breakout_snapshot,stocks,expected,token,client_id,DhanAPI,swing_breakout_quote,
-                              errors=ss.scan_errors, scanning=active is not None, scanned=bool(saved.get('revision')))
+                              errors=ss.scan_errors, scanning=active is not None, scanned=bool(saved.get('revision')),
+                              next_session=next_regular_session, review=opening_review)
 
 if __name__ == "__main__":
     main()
