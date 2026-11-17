@@ -14,20 +14,53 @@ LABELS = dict(ema200='Price vs EMA200',ema50='EMA50 vs EMA200',st='Supertrend (1
 AUDIT = Path(__file__).with_name('breakout_reference')
 
 
-def render_swing_breakout(scan, stocks, expected, token, client_id, make_api, quote_for=None):
+def render_swing_breakout(scan, stocks, expected, token, client_id, make_api, quote_for=None,
+                          *, errors=None, scanning=False, scanned=False, requested=None):
     st.subheader('⚡ Swing breakouts')
     live, history = st.tabs(['Latest daily scan', 'Historical comparison'])
     with live:
         st.caption('A completed daily candle must open on the original side of the level and close beyond it. Wick-only moves and candles that open beyond the level are not counted. The breakout is independent of your original setup filters and cannot trigger an order or a paper entry.')
-        entries=[e for bundle in scan.get('_swing_breakouts',[]) if isinstance(bundle,list) for e in bundle]
-        verified=int(scan.get('Daily source',pd.Series(dtype=str)).eq('Dhan').sum())
-        st.caption(f'Daily candle date {expected:%d %b %Y} IST · {verified} Dhan-verified instruments in the scan. This tab does not use fallback candles.')
+        current=scan.loc[scan['Date'].astype(str).eq(expected.isoformat())] if 'Date' in scan else scan.iloc[:0]
+        source=current.get('Daily source',pd.Series(dtype=str))
+        verified=int(source.eq('Dhan').sum())
+        fallback=int(source.eq('Yahoo Finance').sum())
+        misses=len(errors) if errors is not None else 0
+        st.caption(f"Expected session {expected:%d %b %Y} IST · Dhan {verified} · Yahoo fallback {fallback} · Excluded {misses}"+(f" · Requested {requested}" if requested is not None else ''))
+        with st.expander('Scan data status', expanded=(not verified and (scanned or scanning))):
+            status=current.loc[source.ne('Dhan'),'_breakout_feed_status'] if '_breakout_feed_status' in current else pd.Series(dtype=str)
+            excluded=errors.get('Dhan outcome',pd.Series(dtype=str)) if errors is not None else pd.Series(dtype=str)
+            counts=pd.concat([status,excluded]).value_counts()
+            for name,count in counts.items():
+                st.write(f'{name} · {count}')
+            if not token:
+                st.write('No Dhan access token is configured in Streamlit Secrets.')
+            if misses:
+                cols=['Symbol','Status','Expected date','Dhan candle date','Dhan outcome','Yahoo status']
+                st.dataframe(errors[[c for c in cols if c in errors]],width='stretch',hide_index=True)
+            if not len(counts) and not misses and token:
+                st.write('No provider errors reported for this snapshot.')
         method=st.selectbox('Breakout method',DAILY_METHODS,key='sw_bo_method')
         direction=st.radio('Direction',('Both','CE','PE'),horizontal=True,key='sw_bo_dir')
-        st.caption('Click SCAN NOW in Market scanner to refresh the existing universe. During market hours, this tab shows the previous completed daily session.')
+        include_fallback=st.checkbox('Include Yahoo fallback candles (watchlist only)',key='sw_bo_fallback',
+                                     help='Uses same-date candles already accepted by the Market Scanner. Does not fetch extra data or enable paper entries.')
+        allowed=current
+        if not include_fallback and not current.empty:
+            allowed=current.loc[source.eq('Dhan')]
+        entries=[e for bundle in allowed.get('_swing_breakouts',[]) if isinstance(bundle,list) for e in bundle]
+        st.caption('Click SCAN NOW in Market Scanner to refresh the same universe. Only candles from the expected completed session are shown.')
+        if scanning:
+            st.info('Swing scan in progress. Any rows below are from the previous completed scan of this session.')
         visible=[e for e in entries if e['Method']==method and (direction=='Both' or e['Side']==direction)]
         if not visible:
-            st.info('No matching breakouts in the verified scan.' if verified else 'Waiting for a Dhan-verified scan.')
+            if allowed.empty:
+                if fallback and not include_fallback:
+                    st.warning(f'The scan found {fallback} Yahoo fallback candles, but no Dhan candle for this session. Turn on the fallback checkbox to view them, or keep it off for Dhan-only results.')
+                elif scanned:
+                    st.warning('The scan finished, but no usable daily candles for this session reached the Breakout tab. See Scan data status.')
+                elif not scanning:
+                    st.info('No completed scan yet for this session. Start one in Market Scanner.')
+            else:
+                st.info('Candles loaded successfully. No breakout matched the selected method and direction.')
         else:
             visible.sort(key=lambda e:-abs(e['Beyond level %']))
             records=[]
@@ -57,6 +90,7 @@ def render_swing_breakout(scan, stocks, expected, token, client_id, make_api, qu
             choice=st.selectbox('Inspect a breakout',list(options),key='sw_bo_inspect')
             event=options[choice]
             st.markdown(f"**{event['Breakout']} · {choice} · ₹{event['Close ₹']:,.2f} · broke ₹{event['Level ₹']:,.2f}**")
+            st.caption(f"Candle source · {event.get('Daily source','Unverified')}")
             if token and quote_for and st.button('Check current Dhan option quote',key='sw_bo_quote'):
                 try:
                     quote=quote_for(event['Symbol'],event['Side'])

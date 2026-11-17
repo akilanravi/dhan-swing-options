@@ -321,6 +321,26 @@ def swing_after_close(now):
     return not regular_session(n.date()) or not (9, 15) <= (n.hour, n.minute) < (15, 45)
 
 
+def dhan_feed_status(exc, connected=True):
+    """Short safe status for display without exposing raw provider responses."""
+    if not connected:
+        return 'Dhan access token not configured'
+    if isinstance(exc, MissingSessionCandle):
+        return f'Dhan daily candle available through {exc.actual or "no session"}'
+    if exc is None:
+        return 'Dhan not checked individually after provider spot-check'
+    msg=str(exc).lower()
+    if any(k in msg for k in ('dh-902', 'data api plan')):
+        return 'Dhan Data API access rejected (DH-902)'
+    if any(k in msg for k in ('401','dh-901','invalid_authentication','invalid token')):
+        return 'Dhan authentication rejected'
+    if '429' in msg or 'rate limit' in msg:
+        return 'Dhan rate limit reached'
+    if any(k in msg for k in ('no candles','dh-907')):
+        return 'Dhan returned no candles'
+    return 'Dhan feed or data unavailable'
+
+
 def scan_daily_sources(api, cache, targets, cutoff, now, progress=None):
     """Resolve daily bars for a watchlist, with a fast common-delay path."""
     allow_yahoo = swing_after_close(now)
@@ -397,7 +417,9 @@ def scan_daily_sources(api, cache, targets, cutoff, now, progress=None):
             for x in yahoo_targets:
                 sym, ticker = x['symbol'], yahoo_ticker(x)
                 if ticker in frames:
-                    ready[sym] = frames[ticker], elapsed
+                    fallback=frames[ticker].copy(deep=False)
+                    fallback.attrs['dhan_scan_outcome']=dhan_feed_status(failed.get(sym) or auth_error, api is not None)
+                    ready[sym] = fallback, elapsed
                     failed.pop(sym, None)
                 else:
                     yahoo_notes[sym] = notes.get(ticker, 'Yahoo candle unavailable')
@@ -717,7 +739,7 @@ def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0, *, include_breakouts=F
     }
     # Read-only breakout metadata. The original analysis and paper engine do not read it.
     breakout_rows = []
-    if include_breakouts and daily.attrs.get('candle_source', 'Dhan') == 'Dhan':
+    if include_breakouts:
         ranges = prepare_daily(daily)
         for method in DAILY_METHODS:
             for event in signal_rows(ranges,method,start_date=d.index[-1]):
@@ -729,12 +751,15 @@ def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0, *, include_breakouts=F
                 direction=1 if bs=='CE' else -1
                 breakout_rows.append({
                     'Breakout':'↑ BREAKOUT UP' if bs=='CE' else '↓ BREAKOUT DOWN','Symbol':sym,**event,
+                    'Daily source':row['Daily source'],
                     'Reference stop ₹':event['Close ₹']-direction*risk,
                     'Reference 2R ₹':event['Close ₹']+direction*2*risk,
                     'Existing score':f"{int(r['score_'+bs])}/10",
                     'Checks':{k:reading(k,v) for k,v in checks.items()},
                 })
-    if include_breakouts: row['_swing_breakouts'] = breakout_rows
+    if include_breakouts:
+        row['_swing_breakouts'] = breakout_rows
+        row['_breakout_feed_status'] = daily.attrs.get('dhan_scan_outcome','Dhan candle verified' if row['Daily source']=='Dhan' else 'Dhan not verified')
     hist = [{'Symbol': sym, 'Date': dt.strftime('%Y-%m-%d'), 'Side': s.signal, 'Score': int(s.score), 'Close': float(s.Close)}
             for dt, s in d.tail(cfg['scan_days']).iterrows() if s.signal]
     return row, hist
@@ -1270,6 +1295,7 @@ def background_swing_scan(token, client_id, cache, targets, cutoff, scan_now_ist
                            'Expected date': cutoff.isoformat(),
                            'Dhan candle date': e.actual.isoformat() if stale and e.actual else '',
                            'Yahoo status': yahoo_notes.get(sym, ''),
+                           'Dhan outcome':dhan_feed_status(failed.get(sym),api is not None) if sym in failed else 'Candle received; analysis failed',
                            'Error': str(e)})
     df = pd.DataFrame(results)
     if not df.empty:
@@ -1361,7 +1387,7 @@ def main():
     expected = last_complete_session(scan_now_ist)
     store = get_scan_store()
     skey = hashlib.sha256((token or 'none').encode()).hexdigest()[:12]
-    scan_key = ('mtd-yahoo-v1', skey, expected.isoformat())
+    scan_key = ('mtd-yahoo-v2', skey, expected.isoformat())
     if ss.get('scan_key') != scan_key:
         saved = store.get(scan_key, {})
         ss.scan, ss.history = saved.get('scan', pd.DataFrame()), saved.get('history', pd.DataFrame())
@@ -1382,7 +1408,7 @@ def main():
                 frame, history, errors, requested, seconds=future.result()
                 store[scan_key]={'scan':frame,'history':history,'errors':errors,
                                  'summary':f'{len(frame)} of {requested} current candles · {seconds:.1f} seconds',
-                                 'revision':id(future)}
+                                 'requested':requested,'revision':id(future)}
                 finished_for_owner=(owner_nonce==ss[NONCE])
             except Exception as exc:
                 store[scan_key]={'scan':pd.DataFrame(),'history':pd.DataFrame(),
@@ -1413,8 +1439,7 @@ def main():
 
     cache = get_cache()
     breakout_scan=saved.get('scan',ss.scan)
-    if '_swing_breakouts' in ss.scan:
-        ss.scan=ss.scan.drop(columns='_swing_breakouts')
+    ss.scan=ss.scan.drop(columns=['_swing_breakouts','_breakout_feed_status'],errors='ignore')
     t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards','6 · Trade Decision','7 · Call / Put Backtest','8 · ⚡ Swing Breakout'])
 
     def auto_paper_cycle(api, candidates=None):
@@ -1944,7 +1969,9 @@ def main():
             api=DhanAPI(token,client_id)
             with api.session:
                 return option_for_setup(api,{**row,'Side':side},opt_params,{})
-        render_swing_breakout(breakout_scan,stocks,expected,token,client_id,DhanAPI,swing_breakout_quote)
+        render_swing_breakout(breakout_scan,stocks,expected,token,client_id,DhanAPI,swing_breakout_quote,
+                              errors=ss.scan_errors, scanning=active is not None, scanned=bool(saved.get('revision')),
+                              requested=saved.get('requested'))
 
 if __name__ == "__main__":
     main()
