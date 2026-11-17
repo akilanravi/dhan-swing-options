@@ -39,6 +39,8 @@ import requests
 import streamlit as st
 import altair as alt
 from underlying_backtest import render_backtest
+from swing_breakout import DAILY_METHODS, prepare_daily, signal_rows
+from swing_breakout_view import render_swing_breakout
 from decision_panel import show_panel, load_quote, context
 from swing_data import yahoo_batch, yahoo_ticker
 from dashboard_auth import require_password, read_secret, is_authenticated, NONCE
@@ -639,7 +641,7 @@ def flow_bias(side, fii, dii):
     return label, (side == 'CE' and label == 'FII+DII selling') or (side == 'PE' and label == 'FII+DII buying')
 
 
-def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0):
+def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0, *, include_breakouts=False):
     sym = x['symbol']
     if len(daily) < 215:
         raise ValueError(f'Only {len(daily)} candles (need 215+)')
@@ -713,6 +715,26 @@ def analyze_instrument(x, daily, cfg, fii, dii, secs=0.0):
         'Lot size': x.get('lot'), 'Load sec': round(secs, 2),
         'sid': x['sid'], 'segment': x['segment'], 'instrument': x['instrument'],
     }
+    # Read-only breakout metadata. The original analysis and paper engine do not read it.
+    breakout_rows = []
+    if include_breakouts and daily.attrs.get('candle_source', 'Dhan') == 'Dhan':
+        ranges = prepare_daily(daily)
+        for method in DAILY_METHODS:
+            for event in signal_rows(ranges,method,start_date=d.index[-1]):
+                bs = event['Side']
+                checks = _side_tests(d.tail(1),bs,pd.Series(volavail,index=d.index[-1:]))
+                def reading(key, val):
+                    if key=='volume' and not volavail: return None
+                    return bool(val.iloc[-1])
+                direction=1 if bs=='CE' else -1
+                breakout_rows.append({
+                    'Breakout':'↑ BREAKOUT UP' if bs=='CE' else '↓ BREAKOUT DOWN','Symbol':sym,**event,
+                    'Reference stop ₹':event['Close ₹']-direction*risk,
+                    'Reference 2R ₹':event['Close ₹']+direction*2*risk,
+                    'Existing score':f"{int(r['score_'+bs])}/10",
+                    'Checks':{k:reading(k,v) for k,v in checks.items()},
+                })
+    if include_breakouts: row['_swing_breakouts'] = breakout_rows
     hist = [{'Symbol': sym, 'Date': dt.strftime('%Y-%m-%d'), 'Side': s.signal, 'Score': int(s.score), 'Close': float(s.Close)}
             for dt, s in d.tail(cfg['scan_days']).iterrows() if s.signal]
     return row, hist
@@ -1240,7 +1262,7 @@ def background_swing_scan(token, client_id, cache, targets, cutoff, scan_now_ist
                 raise failed[sym]
             daily, secs = ready[sym]
             c = dict(cfg); c['event_blackout_dates'] = {sym: blackouts}
-            row, h = analyze_instrument(x, daily, c, fii, dii, secs)
+            row, h = analyze_instrument(x, daily, c, fii, dii, secs, include_breakouts=True)
             results.append(row); hist += h
         except Exception as e:
             stale = isinstance(e, MissingSessionCandle)
@@ -1390,7 +1412,10 @@ def main():
         ss.gist_id = journal.gist_id
 
     cache = get_cache()
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards','6 · Trade Decision','7 · Call / Put Backtest'])
+    breakout_scan=saved.get('scan',ss.scan)
+    if '_swing_breakouts' in ss.scan:
+        ss.scan=ss.scan.drop(columns='_swing_breakouts')
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards','6 · Trade Decision','7 · Call / Put Backtest','8 · ⚡ Swing Breakout'])
 
     def auto_paper_cycle(api, candidates=None):
         """Run only on explicit SCAN NOW; no broker orders and no modeled option fills."""
@@ -1912,6 +1937,14 @@ def main():
 
     with t7:
         render_backtest(pd.concat([indices,stocks],ignore_index=True),token,client_id,DhanAPI,'Daily')
+
+    with t8:
+        def swing_breakout_quote(symbol,side):
+            row=ss.scan.loc[ss.scan.Symbol.eq(symbol)].iloc[0].to_dict()
+            api=DhanAPI(token,client_id)
+            with api.session:
+                return option_for_setup(api,{**row,'Side':side},opt_params,{})
+        render_swing_breakout(breakout_scan,stocks,expected,token,client_id,DhanAPI,swing_breakout_quote)
 
 if __name__ == "__main__":
     main()
