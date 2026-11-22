@@ -24,6 +24,7 @@ import base64  # noqa: F401  (kept for future use)
 import hashlib
 import io
 import html
+from pathlib import Path
 import math
 import os
 import threading
@@ -1144,56 +1145,17 @@ HIDE = ['sid', 'segment', 'instrument']
 
 
 
-def apply_dark_theme():
-    st.markdown("""<style>
-    .stApp {background: radial-gradient(ellipse at 85% 0%,#14233a 0%,#080c17 45%,#05070e 100%); color:#e8f2ff;}
-    [data-testid="stSidebar"] {background:linear-gradient(180deg,#101b31,#070c18); border-right:1px solid #26354c;}
-    [data-testid="stHeader"] {background:transparent;}
-    h1,h2,h3 {color:#eaf5ff!important;letter-spacing:-.03em;}
-    h1 {background:linear-gradient(90deg,#6ee7ff,#b69bff,#ff76c7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
-    div[data-testid="stMetric"] {background:#101d32;border:1px solid #28435b;border-radius:16px;padding:14px;}
-    div[data-testid="stMetricValue"] {color:#68e8ff;}
-    div[data-testid="stTabs"] button[aria-selected="true"] {color:#69f4d3!important;border-bottom-color:#69f4d3!important;}
-    div[data-testid="stDataFrame"] {border:1px solid #263a55;border-radius:12px;overflow:hidden;}
-    div.stButton>button[kind="primary"] {background:linear-gradient(110deg,#1763ed,#8546d8);color:white;border:0;border-radius:11px;}
-    .signal-card {background:linear-gradient(140deg,#15223a,#0c1426);border:1px solid #324862;border-radius:18px;padding:18px;min-height:220px;margin-bottom:12px;box-shadow:0 9px 25px #0004;}
-    .signal-card.ce {border-top:3px solid #28e2ad;} .signal-card.pe {border-top:3px solid #ff5f94;}
-    .signal-name {font-size:1.25rem;font-weight:800;color:#f2f8ff;}
-    .signal-sub {color:#a9bdd5;font-size:.8rem;margin:6px 0 12px;}
-    .signal-score {font-size:2rem;font-weight:800;color:#80e8ff;}
-    .signal-pill {display:inline-block;background:#263958;color:#dcf6ff;padding:5px 10px;border-radius:20px;font-size:.75rem;}
-    .signal-levels {color:#d2e4f7;font-size:.82rem;line-height:1.9;}
-    .signal-good {color:#37e6b1;} .signal-bad {color:#ff9dba;}
-    /* Explicit text colors: Streamlit's default light-theme text was black on dark. */
-    .stApp, .stApp p, .stApp span, .stApp label, .stApp li,
-    [data-testid="stSidebar"] p, [data-testid="stSidebar"] span,
-    [data-testid="stSidebar"] label, [data-testid="stWidgetLabel"] *,
-    [data-testid="stMarkdownContainer"] {color:#eaf2ff;}
-    [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * {color:#a8bed9!important;}
-    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] *,
-    [data-testid="stSidebar"] label {color:#d9e8ff!important;}
-    [data-testid="stTabs"] button, [data-testid="stTabs"] button p,
-    [data-testid="stTabs"] button span {color:#c6d7f0!important;}
-    [data-testid="stTabs"] button[aria-selected="true"] *,
-    [data-testid="stTabs"] button[aria-selected="true"] {color:#70f3da!important;}
-    [data-testid="stMetricLabel"] *, [data-testid="stMetricLabel"] {color:#b9cfe9!important;}
-    [data-testid="stMetricValue"] *, [data-testid="stMetricValue"] {color:#69eaff!important;}
-    [data-testid="stMetricDelta"] * {color:#a9d8ff!important;}
-    [data-testid="stCheckbox"] label *, [data-testid="stRadio"] label * {color:#eaf2ff!important;}
-    [data-testid="stSlider"] *, [data-testid="stNumberInput"] label *,
-    [data-testid="stSelectbox"] label * {color:#dcecff!important;}
-    [data-testid="stNumberInput"] input, [data-testid="stTextInput"] input,
-    [data-testid="stTextArea"] textarea, [data-testid="stSelectbox"] div[data-baseweb="select"] > div {
-        background:#17263d!important; color:#f3f8ff!important; border-color:#375170!important;
-    }
-    [data-testid="stNumberInput"] input, [data-testid="stTextInput"] input {color:#f3f8ff!important;}
-    [data-testid="stDataFrame"] {background:#101c2e!important;}
-    [data-testid="stAlert"] {border-radius:12px;}
-    div.stButton > button {background:#1c3150;color:#f4faff!important;border:1px solid #47658b;border-radius:10px;}
-    div.stButton > button * {color:#f4faff!important;}
-    div.stButton > button:hover {border-color:#69eaff;color:#69eaff!important;}
-    /* Charts rendered by Vega/Altair inherit theme from Streamlit config. */
-    </style>""", unsafe_allow_html=True)
+def render_swing_header():
+    st.markdown('''<style>{css}</style>
+<div class="dhan-banner dhan-swing">
+  <div class="dhan-grain" aria-hidden="true"></div>
+  <div class="dhan-banner-content">
+    <div class="dhan-brand">Daily F&O scanner</div>
+    <h1>Dhan Swing Options</h1>
+    <p>Completed daily candles <span aria-hidden="true">·</span> Paper trading</p>
+  </div>
+</div>'''.replace('{css}', Path(__file__).with_name('dashboard_theme.css').read_text(encoding='utf-8')),
+                unsafe_allow_html=True)
 
 
 def eligible_card(row):
@@ -1213,11 +1175,14 @@ def eligible_card(row):
       <div class="signal-name">{name} <span class="signal-pill">{safe(side)}</span></div>
       <div class="signal-sub">{status} · Monthly trend: {trend}</div>
       <div class="signal-sub">Candle checked: {safe(row.get('Date', '—'))} · {safe(row.get('Daily source', 'Dhan'))} · Trigger: {safe(row.get('Month trigger') or '—')}</div>
-      <div class="signal-score">{score}<span style="font-size:.85rem;color:#9bb0ca"> / 10</span></div>
-      <div class="signal-levels">Underlying entry: <b>{price(entry)}</b><br>
-      Underlying SL: <b class="signal-bad">{price(stop)}</b><br>
-      Target 1: <b class="signal-good">{price(t1)}</b> · Target 2: <b class="signal-good">{price(t2)}</b></div>
-      <div class="signal-sub">Reference underlying levels; option premiums must be validated separately.</div>
+      <div class="signal-score">{score}<small> / 10</small></div>
+      <dl class="signal-levels" aria-label="Underlying price levels">
+        <div><dt>Entry</dt><dd>{price(entry)}</dd></div>
+        <div><dt>Stop loss</dt><dd class="signal-bad">{price(stop)}</dd></div>
+        <div><dt>Target 1</dt><dd class="signal-good">{price(t1)}</dd></div>
+        <div><dt>Target 2</dt><dd class="signal-good">{price(t2)}</dd></div>
+      </dl>
+      <div class="signal-sub">Underlying price levels</div>
     </div>"""
 
 def candle_chart(df):
@@ -1246,7 +1211,7 @@ def candle_chart(df):
         field = f'ema{period}'
         if field in source:
             layers.append(alt.Chart(source.dropna(subset=[field])).mark_line(color=line_color, strokeWidth=1.6).encode(x=x, y=alt.Y(f'{field}:Q', scale=alt.Scale(zero=False)), tooltip=[alt.Tooltip('Date:T'), alt.Tooltip(f'{field}:Q', format=',.2f')]))
-    chart = alt.layer(*layers).resolve_scale(y='shared').properties(height=430, background='#0b1424').configure_view(stroke=None)
+    chart = alt.layer(*layers).resolve_scale(y='shared').properties(height=430, background='#101722').configure_view(stroke=None)
     st.altair_chart(chart, use_container_width=True)
     st.caption(CANDLE_LEGEND + ' · EMA9 yellow · EMA21 blue · EMA50 orange · EMA200 purple')
 
@@ -1314,11 +1279,10 @@ def watch_swing_job(future):
 
 
 def main():
-    st.set_page_config(page_title='Dhan Swing Options V3.8 Neon', page_icon='📊', layout='wide')
+    st.set_page_config(page_title='Dhan Swing Options', page_icon='📊', layout='wide')
     require_password('Dhan Swing')
-    apply_dark_theme()
-    st.title('DHAN QUANT · SWING OPTIONS TERMINAL')
-    st.caption('Dhan daily prices + Yahoo after-close fallback · Dhan option quotes · manual execution · no orders are ever sent · research tool, not advice, no guaranteed profit')
+    render_swing_header()
+    st.caption('Dhan option quotes · Yahoo daily fallback after close')
 
     secret = read_secret
     from worker_store import cloud_journal
@@ -1455,7 +1419,7 @@ def main():
                           and v.get('breakout_coverage')]
         breakout_snapshot=max(previous_monthly,key=lambda v:v['breakout_snapshot_date'],default={})
 
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(['1 · Market scanner', '2 · Top CE/PE setups + options', '3 · Trade analysis', '4 · Paper trading', '5 · Eligible signal cards','6 · Trade Decision','7 · Call / Put Backtest','8 · ⚡ Swing Breakout'])
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(['Scanner', 'Option Contracts', 'Charts', 'Paper Trading', 'CE / PE Signals', 'Trade Decision', 'Backtest', 'Swing Breakouts'])
 
     def auto_paper_cycle(api, candidates=None):
         """Run only on explicit SCAN NOW; no broker orders and no modeled option fills."""
@@ -1886,12 +1850,12 @@ def main():
 
     # ============================ TAB 5 ============================
     with t5:
-        st.subheader('ELIGIBLE · CE / PE SIGNAL BOARD')
+        st.subheader('Eligible CE / PE signals')
         st.caption('Only setups that pass your rules appear here. Yahoo setups are for watchlist review, '
                    'not automatic paper entries. The candle date and the original trigger date are shown separately.')
         s = ss.scan
         if s.empty:
-            st.info('Run SCAN NOW on the Market scanner tab to populate these cards.')
+            st.info('Run SCAN NOW on the Scanner tab to populate these cards.')
         else:
             eligible = s[s['Eligible'].fillna(False).astype(bool)].copy()
             a, b, c = st.columns(3)
@@ -1901,7 +1865,7 @@ def main():
             side_filter = st.radio('Show signals', ['All', 'CE', 'PE'], horizontal=True, key='board_side')
             if side_filter != 'All': eligible = eligible[eligible['Side'] == side_filter]
             if eligible.empty:
-                st.warning('No fully eligible setups in this scan. High-scoring rejected stocks remain visible in the Top CE/PE tab.')
+                st.warning('No fully eligible setups in this scan. High-scoring rejected stocks remain visible in the Option Contracts tab.')
             else:
                 eligible = eligible.sort_values(['Score','ADX'], ascending=[False,False])
                 rows = eligible.to_dict('records')
@@ -1922,7 +1886,7 @@ def main():
     with t6:
         st.subheader('Swing trade decision')
         if ss.scan.empty:
-            st.info('Run a Market Scanner scan first.')
+            st.info('Run a scan first.')
         else:
             sym=st.selectbox('Decision symbol', sorted(ss.scan.Symbol.unique()),key='idea_s_symbol')
             row=ss.scan[ss.scan.Symbol.eq(sym)].iloc[0]
